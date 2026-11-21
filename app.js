@@ -1,0 +1,2433 @@
+import {
+  BUILTIN_DICTIONARIES,
+  detectDefaultLang,
+  getBuiltinDictionary,
+  deepMergeDictionary
+} from './dictionary_default.js';
+import {
+  PHASE_COLORS,
+  formatHM,
+  getCalendarDayLunarSummary,
+  getMoonPhaseInfo,
+  getTimeSlot,
+  computePersonalState,
+  computeRawDiagnosticData,
+  findNextDateForLunarDay,
+  parseBirthDateString
+} from './astro_engine.js';
+
+// =========================================================================
+// Chrome Storage / Runtime Bridge (with standalone browser preview fallback)
+// =========================================================================
+const HAS_CHROME_EXT =
+  typeof chrome !== 'undefined' &&
+  Boolean(chrome.storage && chrome.storage.local);
+
+const FALLBACK_STORAGE_KEY = 'lunar_rhythm_ext_state_v1';
+
+const ACTIVE_ALARM_BADGE_COLOR = '#E65100';
+
+const DEFAULT_PERSISTED_STATE = {
+  birthDate: null,
+  birthTime: null,
+  builtinLang: null,
+  dictionaryMode: 'default',
+  customDictionary: null,
+  reminders: [],
+  notifications: {
+    morningEnabled: true,
+    dayEnabled: true,
+    eveningEnabled: true,
+    alarmPushEnabled: true,
+    morning: '08:30',
+    day: '13:30',
+    evening: '20:30'
+  },
+  selectedVoiceURI: '',
+  pendingAutoplay: null,
+  activeAlarm: null
+};
+
+const extBridge = {
+  async loadState() {
+    if (HAS_CHROME_EXT) {
+      const data = await chrome.storage.local.get(Object.keys(DEFAULT_PERSISTED_STATE));
+      return mergePersistedDefaults(data);
+    }
+    try {
+      const raw = localStorage.getItem(FALLBACK_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return mergePersistedDefaults(parsed);
+    } catch {
+      return structuredClone(DEFAULT_PERSISTED_STATE);
+    }
+  },
+  async saveState(patch) {
+    if (HAS_CHROME_EXT) {
+      await chrome.storage.local.set(patch);
+      try {
+        chrome.runtime.sendMessage({ type: 'SYNC_NOW' });
+      } catch {
+        // Service worker may wake asynchronously
+      }
+      return;
+    }
+    const current = await extBridge.loadState();
+    const next = { ...current, ...patch };
+    localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(next));
+  }
+};
+
+function mergePersistedDefaults(data) {
+  const rawNotifs = (data && data.notifications) || {};
+  const legacyCheckpoints =
+    typeof rawNotifs.checkpointsEnabled === 'boolean'
+      ? rawNotifs.checkpointsEnabled
+      : typeof rawNotifs.enabled === 'boolean'
+      ? rawNotifs.enabled
+      : true;
+
+  const morningEnabled =
+    typeof rawNotifs.morningEnabled === 'boolean'
+      ? rawNotifs.morningEnabled
+      : legacyCheckpoints;
+  const dayEnabled =
+    typeof rawNotifs.dayEnabled === 'boolean'
+      ? rawNotifs.dayEnabled
+      : legacyCheckpoints;
+  const eveningEnabled =
+    typeof rawNotifs.eveningEnabled === 'boolean'
+      ? rawNotifs.eveningEnabled
+      : legacyCheckpoints;
+  const alarmPushEnabled =
+    typeof rawNotifs.alarmPushEnabled === 'boolean'
+      ? rawNotifs.alarmPushEnabled
+      : DEFAULT_PERSISTED_STATE.notifications.alarmPushEnabled;
+
+  const builtinLang = BUILTIN_DICTIONARIES[data && data.builtinLang]
+    ? data.builtinLang
+    : detectDefaultLang();
+
+  return {
+    ...DEFAULT_PERSISTED_STATE,
+    ...(data || {}),
+    builtinLang,
+    notifications: {
+      ...DEFAULT_PERSISTED_STATE.notifications,
+      ...rawNotifs,
+      morningEnabled,
+      dayEnabled,
+      eveningEnabled,
+      alarmPushEnabled
+    },
+    reminders: Array.isArray(data && data.reminders) ? data.reminders : [],
+    activeAlarm: (data && data.activeAlarm) || null
+  };
+}
+
+// =========================================================================
+// Application Runtime State
+// =========================================================================
+let appState = structuredClone(DEFAULT_PERSISTED_STATE);
+let selectedDate = startOfDay(new Date());
+let activeTab = 'today';
+let reminderFormMode = 'lunar';
+let dayNoteTargetDate = null;
+let cachedVoices = [];
+let copyPromptResetTimer = null;
+let copyRawResetTimer = null;
+
+function startOfDay(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+}
+
+function toISODate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function isSameCalendarDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function formatHumanDate(d, lang = 'ru-RU') {
+  return d.toLocaleDateString(lang || 'ru-RU', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  });
+}
+
+function formatShortDate(d, lang = 'ru-RU') {
+  return d.toLocaleDateString(lang || 'ru-RU', {
+    day: 'numeric',
+    month: 'short'
+  }).replace('.', '');
+}
+
+function toEnglishOrdinal(n) {
+  const num = Number(n);
+  const mod100 = num % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${num}th`;
+  switch (num % 10) {
+    case 1: return `${num}st`;
+    case 2: return `${num}nd`;
+    case 3: return `${num}rd`;
+    default: return `${num}th`;
+  }
+}
+
+function getActiveBaseDictionary() {
+  return getBuiltinDictionary(appState.builtinLang);
+}
+
+function getActiveDictionary() {
+  const baseDict = getActiveBaseDictionary();
+  if (appState.dictionaryMode === 'custom' && appState.customDictionary) {
+    return deepMergeDictionary(baseDict, appState.customDictionary);
+  }
+  return baseDict;
+}
+
+function getLocalizedZodiacSign(dict, canonicalSign) {
+  return dict.zodiac_names?.[canonicalSign] || canonicalSign;
+}
+
+// =========================================================================
+// Procedural Moon Canvas Renderer
+// =========================================================================
+function renderMoonCanvas(canvas, phaseInfo) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const cx = w / 2;
+  const cy = h / 2;
+  const R = Math.min(w, h) * 0.43;
+
+  const imgData = ctx.createImageData(w, h);
+  const data = imgData.data;
+
+  // Lit side color: #EAB32E -> (234, 179, 46)
+  const litR = 234;
+  const litG = 179;
+  const litB = 46;
+
+  const elongRad = (phaseInfo.elong * Math.PI) / 180;
+  // At elong = 90 (waxing), sx = +1 (right side lit); elong = 270 (waning), sx = -1 (left side lit)
+  const sx = Math.sin(elongRad);
+  const sz = -Math.cos(elongRad);
+
+  // Soft terminator width (~10% of sphere diameter 2.0 => 0.22 in dot space)
+  const softWidth = 0.22;
+  const halfSoft = softWidth * 0.5;
+  const aaWidth = 1.4 / R;
+
+  for (let py = 0; py < h; py++) {
+    const ny = (py - cy) / R;
+    const ny2 = ny * ny;
+    for (let px = 0; px < w; px++) {
+      const nx = (px - cx) / R;
+      const r2 = nx * nx + ny2;
+      const r = Math.sqrt(r2);
+
+      if (r > 1 + aaWidth) continue;
+
+      const edgeAlpha = r <= 1 - aaWidth ? 1 : Math.max(0, Math.min(1, (1 + aaWidth - r) / (2 * aaWidth)));
+      const nz = Math.sqrt(Math.max(0, 1 - Math.min(1, r2)));
+      const dot = nx * sx + nz * sz;
+
+      // Smoothstep across terminator
+      const t = Math.max(0, Math.min(1, (dot + halfSoft) / softWidth));
+      const litMask = t * t * (3 - 2 * t);
+
+      // New moon faint 10% rim contour when illumination is near zero
+      let rimAlpha = 0;
+      if (phaseInfo.illumination < 0.08) {
+        const rimStrength = (0.08 - phaseInfo.illumination) / 0.08;
+        const rimBand = Math.max(0.03, 1.4 / R);
+        const distFromEdge = Math.abs(r - (1 - rimBand * 0.5));
+        if (distFromEdge < rimBand) {
+          rimAlpha = 0.10 * rimStrength * (1 - distFromEdge / rimBand);
+        }
+      }
+
+      const finalAlpha = Math.max(litMask * edgeAlpha, rimAlpha * edgeAlpha);
+      if (finalAlpha <= 0.002) continue;
+
+      const idx = (py * w + px) * 4;
+      // Blend pure #EAB32E for lit surface, soft white for new-moon contour
+      const useRim = rimAlpha > litMask;
+      data[idx] = useRim ? 255 : litR;
+      data[idx + 1] = useRim ? 255 : litG;
+      data[idx + 2] = useRim ? 255 : litB;
+      data[idx + 3] = Math.round(finalAlpha * 255);
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+}
+
+function createMiniMoonCanvas(phaseInfo) {
+  const canvas = document.createElement('canvas');
+  canvas.className = 'tl-moon-canvas';
+  canvas.width = 32;
+  canvas.height = 32;
+  canvas.setAttribute('aria-hidden', 'true');
+  renderMoonCanvas(canvas, phaseInfo);
+  return canvas;
+}
+
+// =========================================================================
+// Web Audio API Chime & Speech Synthesis
+// =========================================================================
+function playNavigationChime() {
+  return new Promise((resolve) => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) {
+        resolve();
+        return;
+      }
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+
+      const freqs = [523.25, 659.25]; // C5 + E5 soft two-tone chime (0.4s)
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.001, now);
+      master.gain.exponentialRampToValueAtTime(0.14, now + 0.03);
+      master.gain.exponentialRampToValueAtTime(0.0008, now + 0.40);
+      master.connect(ctx.destination);
+
+      freqs.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.07);
+        osc.connect(master);
+        osc.start(now + idx * 0.07);
+        osc.stop(now + 0.42);
+      });
+
+      setTimeout(() => {
+        ctx.close().catch(() => {});
+        resolve();
+      }, 420);
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function getVoicesList() {
+  if (!('speechSynthesis' in window)) return [];
+  cachedVoices = window.speechSynthesis.getVoices() || [];
+  return cachedVoices;
+}
+
+function resolveSpeechVoice(langCode, preferredURI) {
+  const voices = getVoicesList();
+  if (!voices.length) return null;
+
+  const targetLang = (langCode || 'ru-RU').toLowerCase();
+  const baseLang = targetLang.split('-')[0];
+
+  if (preferredURI) {
+    const chosen = voices.find(v => v.voiceURI === preferredURI);
+    if (chosen) {
+      // Respect user manual voice choice, or ensure compatibility if language switched
+      if (!langCode || chosen.lang.toLowerCase().startsWith(baseLang)) {
+        return chosen;
+      }
+    }
+  }
+
+  return (
+    voices.find(v => v.lang.toLowerCase() === targetLang) ||
+    voices.find(v => v.lang.toLowerCase().startsWith(baseLang)) ||
+    voices[0]
+  );
+}
+
+async function speakText(text, customPrefix = '') {
+  if (!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+
+  const dict = getActiveDictionary();
+  const lang = dict.meta?.lang || 'ru-RU';
+  let fullText = [customPrefix, text].filter(Boolean).join(' ').trim();
+  if (!fullText) return;
+
+  if (lang.toLowerCase().startsWith('ru')) {
+    fullText = fullText.replace(/\b([1-9]|[12]\d|30)\s+лунные\s+сутки\b/gi, (_, numStr) => {
+      const n = Number(numStr);
+      return RU_ORDINAL_PLURAL_1_TO_30[n]
+        ? `${RU_ORDINAL_PLURAL_1_TO_30[n]} лунные сутки`
+        : `${numStr} лунные сутки`;
+    });
+  }
+
+  const stopBtn = document.getElementById('btn-stop-speech');
+  stopBtn.classList.remove('hidden');
+
+  await playNavigationChime();
+
+  const utterance = new SpeechSynthesisUtterance(fullText);
+  utterance.lang = lang;
+  const voice = resolveSpeechVoice(lang, appState.selectedVoiceURI);
+  if (voice) {
+    utterance.voice = voice;
+    utterance.lang = voice.lang || lang;
+  }
+  utterance.rate = 1.0;
+  utterance.pitch = 1.0;
+
+  const hideStop = () => stopBtn.classList.add('hidden');
+  utterance.onend = hideStop;
+  utterance.onerror = hideStop;
+
+  window.speechSynthesis.speak(utterance);
+}
+
+const RU_ORDINAL_PLURAL_1_TO_30 = {
+  1: 'первые',
+  2: 'вторые',
+  3: 'третьи',
+  4: 'четвёртые',
+  5: 'пятые',
+  6: 'шестые',
+  7: 'седьмые',
+  8: 'восьмые',
+  9: 'девятые',
+  10: 'десятые',
+  11: 'одиннадцатые',
+  12: 'двенадцатые',
+  13: 'тринадцатые',
+  14: 'четырнадцатые',
+  15: 'пятнадцатые',
+  16: 'шестнадцатые',
+  17: 'семнадцатые',
+  18: 'восемнадцатые',
+  19: 'девятнадцатые',
+  20: 'двадцатые',
+  21: 'двадцать первые',
+  22: 'двадцать вторые',
+  23: 'двадцать третьи',
+  24: 'двадцать четвёртые',
+  25: 'двадцать пятые',
+  26: 'двадцать шестые',
+  27: 'двадцать седьмые',
+  28: 'двадцать восьмые',
+  29: 'двадцать девятые',
+  30: 'тридцатые'
+};
+
+function formatLunarDayForSpeech(dayNumber, lang, lunarDayFullLabel) {
+  const baseLang = (lang || 'en').toLowerCase().split(/[-_]/)[0];
+  if (baseLang === 'ru' && RU_ORDINAL_PLURAL_1_TO_30[dayNumber]) {
+    return `${RU_ORDINAL_PLURAL_1_TO_30[dayNumber]} ${lunarDayFullLabel}`;
+  }
+  if (baseLang === 'en') {
+    return `${toEnglishOrdinal(dayNumber)} ${lunarDayFullLabel}`;
+  }
+  return `${dayNumber} ${lunarDayFullLabel}`;
+}
+
+function capitalizeFirst(str) {
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+function uncapitalizeFirst(str) {
+  if (!str) return '';
+  return str.charAt(0).toLowerCase() + str.slice(1);
+}
+
+function stripTrailingDot(str) {
+  return String(str || '').replace(/[.!?\s]+$/g, '').trim();
+}
+
+const PASSIVE_PHASES = new Set(['phase_minimum', 'phase_decline']);
+const ACTIVE_ZODIAC_SIGNS = new Set(['Овен', 'Близнецы', 'Лев', 'Стрелец', 'Водолей']);
+
+function isActiveSignalEdge(edge) {
+  if (!edge) return false;
+  return (
+    edge.transit === 'Mars' ||
+    edge.natal === 'Mars' ||
+    edge.actorKey === 'actor_mars' ||
+    edge.aspectKey === 'edge_conjunction' ||
+    edge.aspectKey === 'edge_sextile'
+  );
+}
+
+function buildHarmonyBridge(personal, sign, dailyFocusEdge, dict = getActiveDictionary()) {
+  if (!personal || !PASSIVE_PHASES.has(personal.phaseKey)) return '';
+  const hasActiveSign = ACTIVE_ZODIAC_SIGNS.has(sign);
+  const hasActiveAspect = isActiveSignalEdge(dailyFocusEdge);
+  if (!hasActiveSign && !hasActiveAspect) return '';
+
+  const labels = getUILabels(dict);
+  if (personal.phaseKey === 'phase_minimum') {
+    return labels.harmony_bridge_minimum;
+  }
+  return labels.harmony_bridge_decline;
+}
+
+function getRotatedLifestyleTip(dict, phaseKey, timeSlot, activeLunarDay, dayInPhase = 1) {
+  const raw = dict.lifestyle_tips?.[phaseKey]?.[timeSlot];
+  if (Array.isArray(raw) && raw.length > 0) {
+    return raw[(Number(activeLunarDay) + Number(dayInPhase)) % raw.length];
+  }
+  return typeof raw === 'string' ? raw : '';
+}
+
+function getEdgeScenarioAdvice(dict, edge) {
+  if (!edge) return '';
+  const matrixText = dict.actor_maneuver_matrix?.[edge.actorKey]?.[edge.aspectKey];
+  if (matrixText) return matrixText;
+  return dict.maneuvers?.[edge.aspectKey]?.advice || '';
+}
+
+function resolveLanguageNameEn(bcp47Lang) {
+  const raw = (bcp47Lang || 'ru-RU').trim();
+  const baseCode = raw.split('-')[0] || 'ru';
+  try {
+    if (typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function') {
+      const display = new Intl.DisplayNames(['en'], { type: 'language' });
+      return display.of(baseCode) || display.of(raw) || 'Russian';
+    }
+  } catch {
+    // Fallback below if DisplayNames cannot resolve custom code
+  }
+  return baseCode === 'ru' ? 'Russian' : raw;
+}
+
+function formatSpeechByLang(baseLang, parts) {
+  const {
+    lunarDaySpeech,
+    trendLabel,
+    signName,
+    lunarDayNote,
+    zodiacHint,
+    illuminationPct,
+    transitionTimeStr,
+    phaseTitle,
+    dayInPhase,
+    phaseDayNote,
+    roleHint,
+    bridgeText,
+    edgeInfo,
+    bgAdvice,
+    tip
+  } = parts;
+
+  if (!phaseTitle) {
+    switch (baseLang) {
+      case 'ru':
+        return [
+          `На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} в знаке ${signName}.`,
+          lunarDayNote,
+          `Обстановка дня располагает к тому, что ${zodiacHint}, а освещённость Луны составляет ${illuminationPct} процентов.`,
+          `Смена лунных суток наступит в ${transitionTimeStr}.`
+        ];
+      case 'es':
+        return [
+          `Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`,
+          lunarDayNote,
+          `La jornada favorece ${zodiacHint}, con una iluminación lunar del ${illuminationPct} por ciento.`,
+          `El cambio de día lunar será a las ${transitionTimeStr}.`
+        ];
+      case 'de':
+        return [
+          `Heute ist der ${lunarDaySpeech}, ${trendLabel} im Zeichen ${signName}.`,
+          lunarDayNote,
+          `Die Tagesstimmung unterstützt ${zodiacHint}, bei ${illuminationPct} Prozent Mondbeleuchtung.`,
+          `Der nächste Mondtag beginnt um ${transitionTimeStr}.`
+        ];
+      case 'fr':
+        return [
+          `Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`,
+          lunarDayNote,
+          `L'ambiance du jour favorise ${zodiacHint}, avec une illumination lunaire de ${illuminationPct} pour cent.`,
+          `Le prochain jour lunaire commence à ${transitionTimeStr}.`
+        ];
+      default:
+        return [
+          `Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} in ${signName}.`,
+          lunarDayNote,
+          `The day favors ${zodiacHint}, with lunar illumination at ${illuminationPct} percent.`,
+          `The next lunar day begins at ${transitionTimeStr}.`
+        ];
+    }
+  }
+
+  const sentences = [];
+  switch (baseLang) {
+    case 'ru':
+      sentences.push(`На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} в знаке ${signName}.`);
+      sentences.push(
+        `Идёт ${dayInPhase}-й день этапа «${phaseTitle}»: ${uncapitalizeFirst(stripTrailingDot(phaseDayNote))}${roleHint ? `, при этом полезнее опираться на ${roleHint}` : ''}.`
+      );
+      if (bridgeText) sentences.push(bridgeText);
+      if (edgeInfo) {
+        const dynMap = {
+          exact: 'пик влияния приходится именно на сегодня',
+          applying: 'тенденция постепенно набирает силу',
+          separating: 'пик уже пройден, и напряжение спадает'
+        };
+        sentences.push(`В сфере «${uncapitalizeFirst(edgeInfo.actorTitle)}» ${uncapitalizeFirst(edgeInfo.advice)}, причём ${dynMap[edgeInfo.dynamicKey]}.`);
+      } else if (!bridgeText) {
+        sentences.push(`Влияние знака ${signName} делает этот день удобным там, где важно ${zodiacHint}.`);
+      }
+      if (bgAdvice) {
+        sentences.push(`${stripTrailingDot(lunarDayNote)}, а на длинной дистанции сегодня ощущается точный пик: ${uncapitalizeFirst(bgAdvice)}.`);
+      } else if (lunarDayNote) {
+        sentences.push(lunarDayNote);
+      }
+      if (tip) sentences.push(tip);
+      return sentences;
+
+    case 'es':
+      sentences.push(`Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`);
+      sentences.push(
+        `Es el día ${dayInPhase} de la fase «${phaseTitle}»: ${uncapitalizeFirst(stripTrailingDot(phaseDayNote))}${roleHint ? `, apoyándose en ${roleHint}` : ''}.`
+      );
+      if (bridgeText) sentences.push(bridgeText);
+      if (edgeInfo) {
+        const dynMap = {
+          exact: 'el punto máximo cae hoy mismo',
+          applying: 'la tendencia va ganando fuerza',
+          separating: 'el pico ya pasó y la tensión disminuye'
+        };
+        sentences.push(`En el ámbito «${uncapitalizeFirst(edgeInfo.actorTitle)}», ${uncapitalizeFirst(edgeInfo.advice)}, y ${dynMap[edgeInfo.dynamicKey]}.`);
+      } else if (!bridgeText) {
+        sentences.push(`La Luna en ${signName} favorece especialmente ${zodiacHint}.`);
+      }
+      if (bgAdvice) {
+        sentences.push(`${stripTrailingDot(lunarDayNote)}, con un pico exacto de fondo: ${uncapitalizeFirst(bgAdvice)}.`);
+      } else if (lunarDayNote) {
+        sentences.push(lunarDayNote);
+      }
+      if (tip) sentences.push(tip);
+      return sentences;
+
+    case 'de':
+      sentences.push(`Heute ist der ${lunarDaySpeech}, ${trendLabel} im Zeichen ${signName}.`);
+      sentences.push(
+        `Es ist Tag ${dayInPhase} der Phase «${phaseTitle}»: ${stripTrailingDot(phaseDayNote)}${roleHint ? `, mit Fokus auf ${roleHint}` : ''}.`
+      );
+      if (bridgeText) sentences.push(bridgeText);
+      if (edgeInfo) {
+        const dynMap = {
+          exact: 'der Höhepunkt liegt genau heute',
+          applying: 'der Einfluss nimmt zu',
+          separating: 'der Höhepunkt ist überschritten und die Lage beruhigt sich'
+        };
+        sentences.push(`Im Bereich «${edgeInfo.actorTitle}» gilt: ${edgeInfo.advice}, wobei ${dynMap[edgeInfo.dynamicKey]}.`);
+      } else if (!bridgeText) {
+        sentences.push(`Der Mond im Zeichen ${signName} unterstützt besonders ${zodiacHint}.`);
+      }
+      if (bgAdvice) {
+        sentences.push(`${stripTrailingDot(lunarDayNote)}, begleitet von einem exakten Hintergrund-Höhepunkt: ${bgAdvice}.`);
+      } else if (lunarDayNote) {
+        sentences.push(lunarDayNote);
+      }
+      if (tip) sentences.push(tip);
+      return sentences;
+
+    case 'fr':
+      sentences.push(`Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`);
+      sentences.push(
+        `Nous sommes au jour ${dayInPhase} de la phase « ${phaseTitle} » : ${uncapitalizeFirst(stripTrailingDot(phaseDayNote))}${roleHint ? `, en s'appuyant sur ${roleHint}` : ''}.`
+      );
+      if (bridgeText) sentences.push(bridgeText);
+      if (edgeInfo) {
+        const dynMap = {
+          exact: 'le pic tombe aujourd\'hui même',
+          applying: 'l\'influence monte en puissance',
+          separating: 'le pic est passé et la tension retombe'
+        };
+        sentences.push(`Dans le domaine « ${uncapitalizeFirst(edgeInfo.actorTitle)} », ${uncapitalizeFirst(edgeInfo.advice)}, et ${dynMap[edgeInfo.dynamicKey]}.`);
+      } else if (!bridgeText) {
+        sentences.push(`La Lune en ${signName} favorise particulièrement ${zodiacHint}.`);
+      }
+      if (bgAdvice) {
+        sentences.push(`${stripTrailingDot(lunarDayNote)}, avec un pic exact de fond : ${uncapitalizeFirst(bgAdvice)}.`);
+      } else if (lunarDayNote) {
+        sentences.push(lunarDayNote);
+      }
+      if (tip) sentences.push(tip);
+      return sentences;
+
+    default:
+      sentences.push(`Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} in ${signName}.`);
+      sentences.push(
+        `You are on day ${dayInPhase} of the "${phaseTitle}" phase: ${uncapitalizeFirst(stripTrailingDot(phaseDayNote))}${roleHint ? `, leaning on ${roleHint}` : ''}.`
+      );
+      if (bridgeText) sentences.push(bridgeText);
+      if (edgeInfo) {
+        const dynMap = {
+          exact: 'peak intensity lands today',
+          applying: 'this influence is steadily building',
+          separating: 'the peak has passed and tension is easing'
+        };
+        sentences.push(`In "${edgeInfo.actorTitle}", ${uncapitalizeFirst(edgeInfo.advice)}, while ${dynMap[edgeInfo.dynamicKey]}.`);
+      } else if (!bridgeText) {
+        sentences.push(`Moon in ${signName} especially supports ${zodiacHint}.`);
+      }
+      if (bgAdvice) {
+        sentences.push(`${stripTrailingDot(lunarDayNote)}, alongside an exact background peak: ${uncapitalizeFirst(bgAdvice)}.`);
+      } else if (lunarDayNote) {
+        sentences.push(lunarDayNote);
+      }
+      if (tip) sentences.push(tip);
+      return sentences;
+  }
+}
+
+function buildBriefingSpeechText() {
+  const dict = getActiveDictionary();
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const baseLang = lang.toLowerCase().split(/[-_]/)[0];
+  const now = new Date();
+  const isToday = isSameCalendarDay(selectedDate, now);
+  const refMoment = isToday
+    ? now
+    : new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0, 0, 0);
+
+  const summary = getCalendarDayLunarSummary(selectedDate, refMoment);
+  const lunarDaySpeech = formatLunarDayForSpeech(
+    summary.activeLunarDay,
+    lang,
+    labels.lunar_day_full
+  );
+  const lunarDayNote = dict.lunar_days?.[String(summary.activeLunarDay)] || '';
+  const trendLabel = dict.moon_trends?.[summary.phaseInfo.trend] || '';
+  const sign = summary.phaseInfo.zodiacSign;
+  const signName = getLocalizedZodiacSign(dict, sign);
+  const zodiacHint = dict.zodiac_hints?.[sign] || '';
+
+  if (!appState.birthDate) {
+    const sentences = formatSpeechByLang(baseLang, {
+      lunarDaySpeech,
+      trendLabel,
+      signName,
+      lunarDayNote,
+      zodiacHint,
+      illuminationPct: summary.phaseInfo.illuminationPct,
+      transitionTimeStr: summary.transitionTimeStr
+    });
+    return sentences.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  const personal = computePersonalState(appState.birthDate, selectedDate, refMoment, appState.birthTime);
+  if (!personal) return '';
+
+  const phase = dict.phases[personal.phaseKey];
+  const role = dict.roles[personal.roleKey];
+  const tip = getRotatedLifestyleTip(
+    dict,
+    personal.phaseKey,
+    personal.timeSlot,
+    summary.activeLunarDay,
+    personal.phaseStage.dayInPhase
+  );
+  const phaseDayNote =
+    dict.phase_day_notes?.[personal.phaseKey]?.[personal.phaseStage.key] ||
+    personal.phaseStage.hint;
+  const bridgeText = buildHarmonyBridge(personal, sign, personal.dailyFocusEdge, dict);
+  const roleHint = role ? uncapitalizeFirst(stripTrailingDot(role.hint)) : '';
+
+  let edgeInfo = null;
+  if (personal.dailyFocusEdge) {
+    const edge = personal.dailyFocusEdge;
+    const actor = dict.actors[edge.actorKey] || dict.actors.actor_moon;
+    edgeInfo = {
+      actorTitle: actor.title,
+      advice: stripTrailingDot(getEdgeScenarioAdvice(dict, edge)),
+      dynamicKey: edge.dynamicKey
+    };
+  }
+
+  const bgAdvice =
+    personal.isBackgroundExactPeak && personal.backgroundEdge
+      ? stripTrailingDot(getEdgeScenarioAdvice(dict, personal.backgroundEdge))
+      : '';
+
+  const sentences = formatSpeechByLang(baseLang, {
+    lunarDaySpeech,
+    trendLabel,
+    signName,
+    lunarDayNote,
+    zodiacHint,
+    phaseTitle: phase.title,
+    dayInPhase: personal.phaseStage.dayInPhase,
+    phaseDayNote,
+    roleHint,
+    bridgeText,
+    edgeInfo,
+    bgAdvice,
+    tip
+  });
+
+  return sentences.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function buildExternalAIPrompt() {
+  const dict = getActiveDictionary();
+  const lang = dict.meta?.lang || 'ru-RU';
+  const now = new Date();
+  const isToday = isSameCalendarDay(selectedDate, now);
+  const refMoment = isToday
+    ? now
+    : new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0, 0, 0);
+
+  const summary = getCalendarDayLunarSummary(selectedDate, refMoment);
+  const personal = appState.birthDate
+    ? computePersonalState(appState.birthDate, selectedDate, refMoment, appState.birthTime)
+    : null;
+
+  const isoDate = toISODate(selectedDate);
+  const humanDate = formatHumanDate(selectedDate, lang);
+  const currentTimeStr = formatHM(refMoment);
+  const activeTimeSlot = personal ? personal.timeSlot : getTimeSlot(refMoment);
+
+  const sign = summary.phaseInfo.zodiacSign;
+  const zodiacHint = dict.zodiac_hints?.[sign] || '';
+  const firstNote = dict.lunar_days?.[String(summary.firstDay)] || '';
+  const secondNote = dict.lunar_days?.[String(summary.secondDay)] || '';
+  const lunarDayNote = dict.lunar_days?.[String(summary.activeLunarDay)] || '';
+  const detailedTrend =
+    dict.moon_phase_names?.[summary.phaseInfo.detailedTrend] ||
+    dict.moon_trends?.[summary.phaseInfo.trend] ||
+    summary.phaseInfo.trend;
+  const targetLangName = resolveLanguageNameEn(lang);
+
+  const lines = [
+    'You are an analytical daily rhythm and productivity strategist.',
+    'Generate a cohesive, practical, realistic plan of action for the selected day based STRICTLY on the pre-computed astronomical and personal telemetry below.',
+    'Treat all supplied telemetry as ground truth. DO NOT recalculate planetary positions, lunar days, aspects, or phases on your own.',
+    '',
+    '### RULES & CONSTRAINTS',
+    `1. OUTPUT CONTRACT & STRICT MONOLINGUAL HEADINGS: Structure your response into strictly 6 numbered sections. Output section titles strictly in ${targetLangName} ONLY (do NOT output bilingual slashes or English translations in the response headings; use these English structural topics purely as internal reference: 1) Remainder of Day Framing, 2) Priorities, 3) Communication, 4) Pacing & Breaks, 5) Recovery, 6) Clarifying Questions). Keep each section concise with a maximum of 7 bullet points per section.`,
+    `2. EVENING & TIME HORIZON (timeSlot: ${activeTimeSlot}): When timeSlot === "evening", plan ONLY from Current Local Time (${currentTimeStr}) until bedtime (assume 23:00 by default if bedtime is unknown, and explicitly state this assumption). When timeSlot === "day", plan strictly from midday/current time onward.`,
+    '3. LATE-NIGHT CUTOFF (< 60 MINS TO BEDTIME): If less than 60 minutes remain before bedtime (23:00 default), collapse the entire action plan into ONE single closing micro-action plus the evening recovery ritual.',
+    '4. NO PAST OR DAYTIME-ONLY TASKS AT NIGHT: Strictly forbid scheduling past hours, morning routines, or daytime-only work/preparations when in the evening window. Only neutral evening preparation for tomorrow morning is allowed (e.g., laying out clothes, clearing the desk, setting an alarm).',
+    '5. PRIORITY CAP (MAX 2): In Section 2 (Priorities), list strictly NO MORE than 2 priority tasks for the remainder of the evening (or current time window) to prevent schedule overload.',
+    '6. CONFLICT RESOLUTION & EXPLICIT IMPULSE NEUTRALIZATION: Whenever an active operational role (e.g., Sprint / Drive) or fast zodiac/aspect hints (e.g., Aries / initiative / fast decisions) coincide with a low-energy personal phase (phase_minimum / phase_decline), explicitly neutralize any impulse to start new tasks, cold outreach, or new projects — channel speed strictly into closing already-started short items and replying to incoming messages.',
+    '7. COMMUNICATION SPLIT (REPLY VS INITIATE): Separate incoming replies from outgoing initiation. During evening hours or low personal pacing, allow replying to incoming requests, and allow initiating messages ONLY if they directly close an open task or handoff. Do not start new discussions or open-ended threads.',
+    '8. LUNAR DAY TRANSITION RULE: Treat the currently active lunar day as primary for all actionable guidance. Treat any earlier/previous lunar day strictly as passive background context without mixing conflicting advice. On any conflict, the active lunar day combined with the personal rest/pacing phase takes priority.',
+    '9. REALISM & TIME-BOXING: Every suggested action must realistically fit into the remaining time window before bedtime or end of day. Any task requiring more than 30-40 minutes must be broken down into a concrete minimal next step or explicitly deferred to tomorrow.',
+    `10. TELEMETRY TRANSLATION (NO PARROTING): Do NOT repeat, quote, or paraphrase raw telemetry numbers, degrees, orb values, or status fields in your output. Translate telemetry directly into actionable behavior using the voice of the active dictionary ("${dict.meta?.name || 'Default'}" — ${dict.meta?.description || 'Rational productivity without esotericism.'}) without adding extra astrology or unrequested esotericism.`,
+    '11. GLOBAL LENGTH & FORMAT CAP: Keep the entire response concise within 450-600 words maximum, formatted in clean bullet points, with NO Markdown tables and ZERO repetition of raw telemetry numbers.',
+    '12. UNCERTAINTY HANDLING: If key context is missing (such as exact bedtime, specific pending documents, or deadlines), deliver the complete plan first using explicit, stated assumptions, then ask 1-2 brief clarifying questions at the very end in Section 6 (strictly max 2 questions).',
+    '13. FINAL QUALITY SELF-CHECK: Before finalizing, verify that your output uses strictly monolingual headings, stays within 450-600 words without Markdown tables, lists max 2 priorities, contains zero medical diagnoses/prescriptions, zero fatalistic claims, zero metaphors/esotericism (unless explicitly defined by a custom active dictionary), zero tasks for past hours, full respect for low personal pacing, and includes at least one deliberate pause plus a concrete evening recovery ritual.',
+    '',
+    '### PRE-COMPUTED TELEMETRY',
+    `- Selected Date: ${isoDate} (${humanDate})`,
+    `- Current Local Time: ${currentTimeStr} (timeSlot: ${activeTimeSlot})`
+  ];
+
+  if (summary.firstDay !== summary.secondDay) {
+    lines.push(
+      `- Lunar Day Timeline: ${toEnglishOrdinal(summary.firstDay)} lunar day (from ${summary.firstDayStartTimeStr}) until ${summary.transitionTimeStr}, followed by ${toEnglishOrdinal(summary.secondDay)} lunar day (starts at ${summary.secondDayStartTimeStr}); primary active now: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day`
+    );
+    if (summary.activeIndex === 0) {
+      if (firstNote) lines.push(`- Primary Active Lunar Day (${summary.firstDay}): ${firstNote}`);
+      if (secondNote) lines.push(`- Upcoming Lunar Day Context (after ${summary.transitionTimeStr}, ${summary.secondDay}): ${secondNote}`);
+    } else {
+      if (firstNote) lines.push(`- Previous Background Lunar Day (${summary.firstDay}, ended at ${summary.transitionTimeStr}): ${firstNote}`);
+      if (secondNote) lines.push(`- Primary Active Lunar Day (${summary.secondDay}): ${secondNote}`);
+    }
+  } else {
+    lines.push(
+      `- Lunar Day Timeline: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day all day (from ${summary.firstDayStartTimeStr}, next transition at ${summary.transitionTimeStr}); primary active now: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day`
+    );
+    if (lunarDayNote) lines.push(`- Primary Active Lunar Day (${summary.activeLunarDay}): ${lunarDayNote}`);
+  }
+
+  lines.push(
+    `- Moon Phase & Illumination: ${detailedTrend}, Moon age ${summary.phaseInfo.moonAge.toFixed(1)} days, ${summary.phaseInfo.illuminationExact.toFixed(1)}% illuminated`,
+    `- Moon Zodiac Sign: ${sign} (${zodiacHint})`
+  );
+
+  if (personal) {
+    const profileObj = dict.profiles[personal.profileKey];
+    const ageObj = dict.age_classes[personal.ageClassKey];
+    const phaseObj = dict.phases[personal.phaseKey];
+    const roleObj = dict.roles[personal.roleKey];
+    const phaseDayNote =
+      dict.phase_day_notes?.[personal.phaseKey]?.[personal.phaseStage.key] ||
+      personal.phaseStage.hint;
+    const hasTension = Boolean(buildHarmonyBridge(personal, sign, personal.dailyFocusEdge));
+    const tipText = getRotatedLifestyleTip(
+      dict,
+      personal.phaseKey,
+      personal.timeSlot,
+      summary.activeLunarDay,
+      personal.phaseStage.dayInPhase
+    );
+
+    lines.push(
+      `- Birth Profile: ${profileObj?.title || personal.profileKey}`,
+      `- Age Guideline: ${ageObj?.title || personal.ageClassKey} — ${ageObj?.modifier_hint || ''}`,
+      `- Personal Cycle Phase: ${phaseObj?.title || personal.phaseKey} (${personal.phaseKey}) [${phaseObj?.badge || ''}, ${phaseObj?.tempo || ''}], Day ${personal.phaseStage.dayInPhase} of ${personal.phaseStage.totalDays} (${personal.phaseStage.label})`,
+      `- Phase Focus: ${phaseDayNote}`,
+      `- Operational Role: ${roleObj?.title || personal.roleKey} (${personal.roleKey}) — ${roleObj?.hint || ''}`
+    );
+
+    if (hasTension) {
+      lines.push(
+        `- Pacing Harmonization: Active external/role momentum overlaps with a low-tempo personal phase; restrict energy strictly to closing already-started short tasks and incoming replies rather than starting new initiatives.`
+      );
+    }
+
+    if (personal.dailyFocusEdge) {
+      const e = personal.dailyFocusEdge;
+      const actor = dict.actors[e.actorKey] || dict.actors.actor_moon;
+      const maneuver = dict.maneuvers[e.aspectKey];
+      const aspectTitle = maneuver?.title || `${e.angle}° aspect`;
+      const advice = getEdgeScenarioAdvice(dict, e);
+      const dyn = dict.aspect_dynamics?.[e.dynamicKey] || e.dynamicKey;
+      lines.push(
+        `- Primary Daily Aspect: ${e.transit} -> natal ${e.natal}: ${aspectTitle} (${e.angle}°, orb ${e.diff}°)`,
+        `  - Sphere: ${actor?.title || e.actorKey}`,
+        `  - Guidance: ${advice} (${dyn})`
+      );
+    } else {
+      lines.push(`- Primary Daily Focus: Moon in ${sign} (${zodiacHint})`);
+    }
+
+    if (personal.backgroundEdge) {
+      const bg = personal.backgroundEdge;
+      const bgActor = dict.actors[bg.actorKey];
+      const bgManeuver = dict.maneuvers[bg.aspectKey];
+      const bgTitle = bgManeuver?.title || `${bg.angle}° aspect`;
+      const bgAdvice = getEdgeScenarioAdvice(dict, bg);
+      const bgDyn = dict.aspect_dynamics?.[bg.dynamicKey] || bg.dynamicKey;
+      lines.push(
+        `- Weekly Background Aspect: ${bg.transit} -> natal ${bg.natal}: ${bgTitle} (${bg.angle}°, orb ${bg.diff}°, exact peak today: ${personal.isBackgroundExactPeak ? 'YES' : 'NO'})`,
+        `  - Context (${bgActor?.title || bg.actorKey}): ${bgAdvice} (${bgDyn})`
+      );
+    } else {
+      lines.push('- Weekly Background Aspect: None active within orb');
+    }
+
+    lines.push(`- Recommended Lifestyle Habit (${personal.timeSlot}): ${tipText}`);
+  } else {
+    lines.push('- Personal Cycle / Birth Profile: Not provided (General Lunar Calendar mode)');
+  }
+
+  lines.push(
+    `- Active Dictionary: ${dict.meta?.name || 'Default'} (${lang})`,
+    '',
+    `IMPORTANT: Write your entire response in ${targetLangName}. Follow the 6-section output contract strictly.`
+  );
+
+  return lines.join('\n');
+}
+
+// =========================================================================
+// Rendering: Hero, Today, Timeline, Reminders, Settings
+// =========================================================================
+function getUILabels(dict = getActiveDictionary()) {
+  const baseLabels = getActiveBaseDictionary().ui_labels || {};
+  return {
+    ...baseLabels,
+    ...(dict.ui_labels || {})
+  };
+}
+
+function renderUI() {
+  const dict = getActiveDictionary();
+  updateStaticUILabels(dict);
+  renderHeroAndToday(dict);
+  renderTimelineStrip(dict);
+  renderRemindersList(dict);
+  renderSettingsPanel(dict);
+  notifyPreviewHost();
+}
+
+function updateStaticUILabels(dict) {
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const baseLang = lang.split('-')[0] || 'ru';
+
+  document.documentElement.lang = baseLang;
+  document.title = `${labels.app_title} — ${labels.app_subtitle}`;
+
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (key && labels[key]) {
+      el.textContent = labels[key];
+    }
+  });
+
+  document.getElementById('hero-age-unit').textContent = labels.moon_age_unit;
+  document.getElementById('moon-canvas').setAttribute('aria-label', labels.hero_moon_aria);
+  document.getElementById('hero-illumination').title = labels.hero_illumination_title;
+
+  const copyBtn = document.getElementById('btn-copy-ai-prompt');
+  copyBtn.title = labels.btn_copy_prompt_title;
+  copyBtn.setAttribute('aria-label', labels.btn_copy_prompt_aria);
+  document.getElementById('hero-prompt-label').textContent = labels.prompt_copied_toast;
+
+  const speakBtn = document.getElementById('btn-speak-briefing');
+  speakBtn.title = labels.btn_speak_briefing;
+  speakBtn.setAttribute('aria-label', labels.btn_speak_briefing);
+
+  const stopBtn = document.getElementById('btn-stop-speech');
+  stopBtn.title = labels.btn_stop_speech;
+  stopBtn.setAttribute('aria-label', labels.btn_stop_speech);
+
+  document.getElementById('btn-toggle-reminder-form').textContent = `+ ${labels.btn_add_reminder}`;
+  document.getElementById('mode-btn-lunar').textContent = labels.tab_by_lunar_day;
+  document.getElementById('mode-btn-date').textContent = labels.tab_by_date;
+
+  document.getElementById('day-note-input').placeholder = labels.day_note_placeholder;
+  document.getElementById('input-reminder-text').placeholder = labels.placeholder_reminder_text;
+  document.getElementById('btn-close-day-note').setAttribute('aria-label', labels.btn_close);
+  document.getElementById('timeline-section').setAttribute('aria-label', labels.timeline_aria);
+  document.getElementById('lunar-timeline-strip').setAttribute('aria-label', labels.timeline_aria);
+  document.getElementById('day-note-panel').setAttribute('aria-label', labels.day_note_title);
+  document.getElementById('tab-today').setAttribute('aria-label', labels.nav_today);
+  document.getElementById('tab-reminders').setAttribute('aria-label', labels.nav_reminders);
+  document.getElementById('tab-settings').setAttribute('aria-label', labels.nav_settings);
+  document.getElementById('select-builtin-lang').setAttribute('aria-label', labels.label_builtin_lang);
+  document.getElementById('input-birth-date').setAttribute('aria-label', labels.label_birth_date);
+  const birthTimeEl = document.getElementById('input-birth-time');
+  birthTimeEl.setAttribute('aria-label', labels.label_birth_time);
+  birthTimeEl.title = labels.title_birth_time;
+  const copyRawBtn = document.getElementById('btn-copy-raw-data');
+  if (!copyRawBtn.classList.contains('is-copied')) {
+    copyRawBtn.textContent = labels.btn_copy_raw_data;
+  }
+  document.getElementById('input-time-morning').setAttribute('aria-label', labels.slot_morning);
+  document.getElementById('input-time-day').setAttribute('aria-label', labels.slot_day);
+  document.getElementById('input-time-evening').setAttribute('aria-label', labels.slot_evening);
+
+  const lunarSelect = document.getElementById('input-lunar-day');
+  Array.from(lunarSelect.options).forEach((opt, idx) => {
+    opt.textContent = `${idx + 1} ${labels.lunar_day_full}`;
+  });
+}
+
+const RU_ZODIAC_GENITIVE = {
+  'Овен': 'Овна',
+  'Телец': 'Тельца',
+  'Близнецы': 'Близнецов',
+  'Рак': 'Рака',
+  'Лев': 'Льва',
+  'Дева': 'Девы',
+  'Весы': 'Весов',
+  'Скорпион': 'Скорпиона',
+  'Стрелец': 'Стрельца',
+  'Козерог': 'Козерога',
+  'Водолей': 'Водолея',
+  'Рыбы': 'Рыб'
+};
+
+function getRuZodiacGenitive(canonicalSign, signName) {
+  if (signName === canonicalSign && RU_ZODIAC_GENITIVE[canonicalSign]) {
+    return RU_ZODIAC_GENITIVE[canonicalSign];
+  }
+  return signName;
+}
+
+function getRuOrdinalNumeric(dayNum) {
+  const n = Number(dayNum);
+  return n === 3 || n === 23 ? `${n}-и` : `${n}-е`;
+}
+
+function getRuAccusativePhrase(text) {
+  if (!text) return '';
+  if (text === 'Высокая динамика') return 'высокую динамику';
+  return uncapitalizeFirst(text);
+}
+
+function mapGuestPhaseKey(detailedTrend) {
+  switch (detailedTrend) {
+    case 'new':
+    case 'waning_crescent':
+      return 'phase_minimum';
+    case 'waxing_crescent':
+    case 'first_quarter':
+      return 'phase_rise';
+    case 'waxing_gibbous':
+    case 'full':
+      return 'phase_peak';
+    case 'waning_gibbous':
+    case 'last_quarter':
+    default:
+      return 'phase_decline';
+  }
+}
+
+function resolveDayStatus(personal, summary, dict, labels) {
+  if (personal) {
+    const isPassive = PASSIVE_PHASES.has(personal.phaseKey);
+    const top = personal.dailyFocusEdge;
+    const valence = top ? (dict.maneuvers?.[top.aspectKey]?.valence || 'neutral') : 'neutral';
+
+    if (personal.phaseKey === 'phase_minimum' || (personal.phaseKey === 'phase_decline' && valence === 'warning')) {
+      return { key: 'refrain', label: labels.day_status_refrain };
+    }
+    if (isPassive || valence === 'warning') {
+      return { key: 'caution', label: labels.day_status_caution };
+    }
+    return { key: 'favorable', label: labels.day_status_favorable };
+  }
+
+  const trend = summary.phaseInfo.detailedTrend;
+  if (trend === 'new' || trend === 'waning_crescent') {
+    return { key: 'refrain', label: labels.day_status_refrain };
+  }
+  if (trend === 'first_quarter' || trend === 'last_quarter') {
+    return { key: 'caution', label: labels.day_status_caution };
+  }
+  return { key: 'favorable', label: labels.day_status_favorable };
+}
+
+function buildTodayIntroText(baseLang, ctx) {
+  const {
+    isToday,
+    isPersonal,
+    statusKey,
+    hasWarning,
+    phaseKey,
+    phaseTitle,
+    dayInPhase,
+    totalDays,
+    profileTitle,
+    ageTitle,
+    activeLunarDay,
+    lunarDayFullLabel,
+    canonicalSign,
+    signName,
+    zodiacHint,
+    detailedTrendLabel,
+    illuminationStr
+  } = ctx;
+
+  const signRuGen = getRuZodiacGenitive(canonicalSign, signName);
+
+  if (!isPersonal) {
+    switch (baseLang) {
+      case 'ru': {
+        const dayStr = `${getRuOrdinalNumeric(activeLunarDay)} ${lunarDayFullLabel}`;
+        const moonLoc = isToday ? `сегодня Луна в знаке ${signRuGen}` : `в этот день Луна в знаке ${signRuGen}`;
+        const lead = `Идут ${dayStr}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).`;
+        if (statusKey === 'refrain') {
+          return `${lead} Лучше воздержаться от новых стартов, крупных обязательств и поспешных решений — время подходит для спокойного завершения дел и восстановления.`;
+        }
+        if (statusKey === 'caution') {
+          return `${lead} Стоит избегать перегрузок и суеты — благоприятно для выверенных дел (${zodiacHint}).`;
+        }
+        return `${lead} Благоприятно для задач, где помогают ${zodiacHint}.`;
+      }
+      case 'es': {
+        const moonLoc = isToday ? `hoy la Luna está en ${signName}` : `la Luna está en ${signName}`;
+        const lead = `Transcurre el ${activeLunarDay}.º ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).`;
+        if (statusKey === 'refrain') {
+          return `${lead} Mejor abstenerse de nuevos comienzos, grandes compromisos y decisiones apresuradas — momento propicio para cerrar pendientes y descansar.`;
+        }
+        if (statusKey === 'caution') {
+          return `${lead} Conviene evitar sobrecargas y prisas — favorable para pasos medidos (${zodiacHint}).`;
+        }
+        return `${lead} Favorable para tareas donde ayuda ${zodiacHint}.`;
+      }
+      case 'de': {
+        const moonLoc = isToday ? `heute steht der Mond im Zeichen ${signName}` : `der Mond steht im Zeichen ${signName}`;
+        const lead = `Es läuft der ${activeLunarDay}. ${lunarDayFullLabel}, ${moonLoc} (${detailedTrendLabel}, ${illuminationStr}%).`;
+        if (statusKey === 'refrain') {
+          return `${lead} Besser zurückhalten bei Neustarts, großen Verpflichtungen und vorschnellen Entscheidungen — ruhige Zeit für Abschlüsse und Erholung.`;
+        }
+        if (statusKey === 'caution') {
+          return `${lead} Vermeiden Sie Überlastung und Hektik — geeignet für überlegte Schritte (${zodiacHint}).`;
+        }
+        return `${lead} Günstig für Vorhaben mit Fokus auf ${zodiacHint}.`;
+      }
+      case 'fr': {
+        const moonLoc = isToday ? `aujourd'hui la Lune est en ${signName}` : `la Lune est en ${signName}`;
+        const lead = `Nous sommes au ${activeLunarDay}e ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).`;
+        if (statusKey === 'refrain') {
+          return `${lead} Mieux vaut s'abstenir de nouveaux départs, de gros engagements et de décisions hâtives — temps calme propice au bouclage et au repos.`;
+        }
+        if (statusKey === 'caution') {
+          return `${lead} Évitez la surcharge et la précipitation — utile pour avancer avec mesure (${zodiacHint}).`;
+        }
+        return `${lead} Favorable aux démarches soutenues par ${zodiacHint}.`;
+      }
+      default: {
+        const moonLoc = isToday ? `today the Moon is in ${signName}` : `the Moon is in ${signName}`;
+        const lead = `It is the ${toEnglishOrdinal(activeLunarDay)} ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).`;
+        if (statusKey === 'refrain') {
+          return `${lead} Best to refrain from new launches, major commitments, and hasty decisions — a quiet window for wrapping up open items and recovery.`;
+        }
+        if (statusKey === 'caution') {
+          return `${lead} Avoid overloading your schedule or rushing — workable for measured steps (${zodiacHint}).`;
+        }
+        return `${lead} Favorable for tasks supported by ${zodiacHint}.`;
+      }
+    }
+  }
+
+  switch (baseLang) {
+    case 'ru': {
+      const courseSentence = `Основной курс дня — ${uncapitalizeFirst(phaseTitle)} (день ${dayInPhase} из ${totalDays}): опирайтесь на ${uncapitalizeFirst(profileTitle)} и ${getRuAccusativePhrase(ageTitle)}.`;
+      const dayStr = `${getRuOrdinalNumeric(activeLunarDay)} ${lunarDayFullLabel}`;
+      const moonLoc = isToday ? `сегодня Луна в знаке ${signRuGen}` : `в этот день Луна в знаке ${signRuGen}`;
+      let guidanceSentence = '';
+      let lunarFocus = '';
+
+      if (phaseKey === 'phase_minimum') {
+        guidanceSentence = 'Лучше воздержаться от новых стартов, крупных обязательств и импульсивных решений.';
+        lunarFocus = 'спокойного анализа опыта, рутины и переписки';
+      } else if (phaseKey === 'phase_decline') {
+        guidanceSentence = hasWarning
+          ? 'Лучше воздержаться от споров, спешки и запуска новых проектов — сосредоточьтесь на завершении текущих дел.'
+          : 'Лучше воздержаться от запуска новых проектов, лишних обещаний и резкой смены планов — сделайте упор на завершение текущих дел.';
+        lunarFocus = 'подведения итогов, работы с документами и наведения порядка';
+      } else if (phaseKey === 'phase_rise') {
+        guidanceSentence = hasWarning
+          ? 'Стоит воздержаться от распыления и непроверенных обещаний — сделайте упор на пошаговое планирование и проверку деталей.'
+          : 'Благоприятно сделать упор на пошаговое планирование, сбор данных и спокойную подготовку к запуску.';
+        lunarFocus = `задач, где важны ${zodiacHint}`;
+      } else {
+        guidanceSentence = hasWarning
+          ? 'Стоит воздержаться от резкости и поспешных конфликтов — направьте ресурс на ключевые переговоры и сложные задачи.'
+          : 'Благоприятно направить высокий ресурс на ключевые переговоры, запуск важных проектов и ответственные решения.';
+        lunarFocus = `задач, где важны ${zodiacHint}`;
+      }
+
+      return `${courseSentence} ${guidanceSentence} Идут ${dayStr}, ${moonLoc} — благоприятно для ${lunarFocus}.`;
+    }
+    case 'es': {
+      const courseSentence = `El rumbo principal de hoy es ${phaseTitle.toLowerCase()} (día ${dayInPhase} de ${totalDays}): apóyate en ${profileTitle.toLowerCase()} y ${ageTitle.toLowerCase()}.`;
+      const moonLoc = isToday ? `hoy la Luna está en ${signName}` : `la Luna está en ${signName}`;
+      let guidanceSentence = '';
+      let lunarFocus = '';
+
+      if (phaseKey === 'phase_minimum') {
+        guidanceSentence = 'Mejor abstenerse de nuevos comienzos, grandes compromisos y decisiones impulsivas.';
+        lunarFocus = 'el análisis tranquilo, la rutina ligera y responder mensajes';
+      } else if (phaseKey === 'phase_decline') {
+        guidanceSentence = hasWarning
+          ? 'Mejor abstenerse de discusiones, prisas y nuevos proyectos — concéntrate en cerrar las tareas en curso.'
+          : 'Mejor abstenerse de lanzar nuevos proyectos, promesas innecesarias y cambios bruscos — prioriza cerrar lo iniciado.';
+        lunarFocus = 'cerrar pendientes, revisar documentos y ordenar procesos';
+      } else if (phaseKey === 'phase_rise') {
+        guidanceSentence = hasWarning
+          ? 'Conviene abstenerse de dispersarse o prometer sin verificar — enfócate en planificar paso a paso y revisar detalles.'
+          : 'Favorable para enfocarse en planificar paso a paso, reunir datos y preparar lanzamientos con calma.';
+        lunarFocus = zodiacHint;
+      } else {
+        guidanceSentence = hasWarning
+          ? 'Conviene evitar la brusquedad y conflictos apresurados — dirige tu recurso a negociaciones clave y tareas exigentes.'
+          : 'Favorable para dirigir tu energía alta a negociaciones clave, lanzamientos importantes y decisiones firmes.';
+        lunarFocus = zodiacHint;
+      }
+
+      return `${courseSentence} ${guidanceSentence} Transcurre el ${activeLunarDay}.º ${lunarDayFullLabel}, ${moonLoc} — favorable para ${lunarFocus}.`;
+    }
+    case 'de': {
+      const courseSentence = `Der heutige Hauptkurs ist ${phaseTitle} (Tag ${dayInPhase} von ${totalDays}): stützen Sie sich auf ${profileTitle} und ${ageTitle}.`;
+      const moonLoc = isToday ? `heute steht der Mond im Zeichen ${signName}` : `der Mond steht im Zeichen ${signName}`;
+      let guidanceSentence = '';
+      let lunarFocus = '';
+
+      if (phaseKey === 'phase_minimum') {
+        guidanceSentence = 'Besser zurückhalten bei Neustarts, großen Verpflichtungen und impulsiven Entscheidungen.';
+        lunarFocus = 'ruhige Auswertung, leichte Routine und Korrespondenz';
+      } else if (phaseKey === 'phase_decline') {
+        guidanceSentence = hasWarning
+          ? 'Besser zurückhalten bei Debatten, Hektik und neuen Projekten — konzentrieren Sie sich auf den Abschluss laufender Aufgaben.'
+          : 'Besser zurückhalten bei neuen Projektstarts, unnötigen Zusagen und abrupten Wechseln — setzen Sie auf den Abschluss laufender Aufgaben.';
+        lunarFocus = 'Abschlüsse, Dokumentation und ruhiges Nacharbeiten';
+      } else if (phaseKey === 'phase_rise') {
+        guidanceSentence = hasWarning
+          ? 'Vermeiden Sie Verzettelung und ungeprüfte Zusagen — setzen Sie auf schrittweise Planung und Detailprüfung.'
+          : 'Günstig für den Fokus auf schrittweise Planung, Datensammlung und ruhige Startvorbereitung.';
+        lunarFocus = zodiacHint;
+      } else {
+        guidanceSentence = hasWarning
+          ? 'Vermeiden Sie Schärfe und vorschnelle Konflikte — lenken Sie Ihre Energie auf Schlüsselgespräche und komplexe Aufgaben.'
+          : 'Günstig, um hohe Energie in Schlüsselgespräche, wichtige Projektstarts und klare Entscheidungen zu lenken.';
+        lunarFocus = zodiacHint;
+      }
+
+      return `${courseSentence} ${guidanceSentence} Es läuft der ${activeLunarDay}. ${lunarDayFullLabel}, ${moonLoc} — günstig für ${lunarFocus}.`;
+    }
+    case 'fr': {
+      const courseSentence = `Le cap principal du jour est ${phaseTitle.toLowerCase()} (jour ${dayInPhase} sur ${totalDays}) : appuyez-vous sur ${profileTitle.toLowerCase()} et ${ageTitle.toLowerCase()}.`;
+      const moonLoc = isToday ? `aujourd'hui la Lune est en ${signName}` : `la Lune est en ${signName}`;
+      let guidanceSentence = '';
+      let lunarFocus = '';
+
+      if (phaseKey === 'phase_minimum') {
+        guidanceSentence = "Mieux vaut s'abstenir de nouveaux départs, de gros engagements et de décisions impulsives.";
+        lunarFocus = "l'analyse calme, la routine légère et les échanges écrits";
+      } else if (phaseKey === 'phase_decline') {
+        guidanceSentence = hasWarning
+          ? "Mieux vaut s'abstenir de débats, de précipitation et de nouveaux projets — concentrez-vous sur la clôture des dossiers en cours."
+          : "Mieux vaut s'abstenir de lancer de nouveaux projets, de promesses superflues et de virages brusques — misez sur la clôture des dossiers en cours.";
+        lunarFocus = 'la clôture des dossiers, la documentation et la mise en ordre';
+      } else if (phaseKey === 'phase_rise') {
+        guidanceSentence = hasWarning
+          ? "Mieux vaut éviter la dispersion et les promesses non vérifiées — misez sur la planification par étapes et la vérification des détails."
+          : "Favorable pour miser sur la planification par étapes, la collecte d'informations et une préparation posée.";
+        lunarFocus = zodiacHint;
+      } else {
+        guidanceSentence = hasWarning
+          ? "Évitez la brusquerie et les conflits précipités — canalisez votre énergie vers les négociations clés et les tâches exigeantes."
+          : 'Favorable pour orienter votre pleine énergie vers les négociations clés, les lancements majeurs et les décisions nettes.';
+        lunarFocus = zodiacHint;
+      }
+
+      return `${courseSentence} ${guidanceSentence} Nous sommes au ${activeLunarDay}e ${lunarDayFullLabel}, ${moonLoc} — favorable pour ${lunarFocus}.`;
+    }
+    default: {
+      const courseSentence = `Today's core course is ${phaseTitle.toLowerCase()} (day ${dayInPhase} of ${totalDays}): lean on ${profileTitle.toLowerCase()} and ${ageTitle.toLowerCase()}.`;
+      const moonLoc = isToday ? `today the Moon is in ${signName}` : `the Moon is in ${signName}`;
+      let guidanceSentence = '';
+      let lunarFocus = '';
+
+      if (phaseKey === 'phase_minimum') {
+        guidanceSentence = 'Best to refrain from new launches, major commitments, and impulsive decisions.';
+        lunarFocus = 'calm review, light routine, and correspondence';
+      } else if (phaseKey === 'phase_decline') {
+        guidanceSentence = hasWarning
+          ? 'Best to refrain from disputes, rushing, and new projects — focus on finishing ongoing tasks.'
+          : 'Best to refrain from launching new projects, extra commitments, and abrupt changes — focus on finishing ongoing work.';
+        lunarFocus = 'wrapping up tasks, organizing documents, and steady review';
+      } else if (phaseKey === 'phase_rise') {
+        guidanceSentence = hasWarning
+          ? 'Avoid scattering focus or making unverified promises — lean into step-by-step planning and checking details.'
+          : 'Favorable to focus on step-by-step planning, gathering data, and calm launch preparation.';
+        lunarFocus = zodiacHint;
+      } else {
+        guidanceSentence = hasWarning
+          ? 'Avoid harshness and hasty conflicts — channel high resources into key negotiations and demanding tasks.'
+          : 'Favorable to channel high resources into key negotiations, major project launches, and decisive action.';
+        lunarFocus = zodiacHint;
+      }
+
+      return `${courseSentence} ${guidanceSentence} It is the ${toEnglishOrdinal(activeLunarDay)} ${lunarDayFullLabel}, ${moonLoc} — favorable for ${lunarFocus}.`;
+    }
+  }
+}
+
+function buildSlotCardsData(baseLang, ctx) {
+  const {
+    labels,
+    isPersonal,
+    phaseDayNote,
+    roleHint,
+    bridgeText,
+    edgeDetail,
+    bgDetail,
+    canonicalSign,
+    signName,
+    zodiacHint,
+    detailedTrendLabel,
+    activeLunarDay,
+    lunarDayFullLabel,
+    lunarDayNote,
+    firstDay,
+    secondDay,
+    transitionTimeStr,
+    tips
+  } = ctx;
+
+  const signRuGen = getRuZodiacGenitive(canonicalSign, signName);
+  const bridgePrefix = bridgeText ? `${bridgeText} ` : '';
+
+  // 1. Morning text
+  let morningText = '';
+  if (isPersonal) {
+    morningText = [phaseDayNote, roleHint, tips.morning].filter(Boolean).join(' ');
+  } else {
+    const guestMorningByLang = {
+      ru: `Утренний ориентир задаёт ${uncapitalizeFirst(detailedTrendLabel)} в знаке ${signRuGen}.`,
+      es: `La mañana queda marcada por ${uncapitalizeFirst(detailedTrendLabel)} en ${signName}.`,
+      de: `Den Morgen prägt die Phase ${detailedTrendLabel} im Zeichen ${signName}.`,
+      fr: `La matinée est guidée par ${uncapitalizeFirst(detailedTrendLabel)} en ${signName}.`,
+      en: `The morning tone is set by ${uncapitalizeFirst(detailedTrendLabel)} in ${signName}.`
+    };
+    morningText = [guestMorningByLang[baseLang] || guestMorningByLang.en, tips.morning].filter(Boolean).join(' ');
+  }
+
+  // 2. Day text
+  let dayTactics = '';
+  if (isPersonal && edgeDetail) {
+    const aspectLine = `${edgeDetail.actorTitle} — ${uncapitalizeFirst(edgeDetail.maneuverTitle)}. ${edgeDetail.scenarioAdvice} ${edgeDetail.dynamicText}`.trim();
+    let bgLine = '';
+    if (bgDetail) {
+      const bgSentence = `${bgDetail.actorTitle} — ${uncapitalizeFirst(bgDetail.maneuverTitle)}: ${uncapitalizeFirst(bgDetail.advice)}`;
+      const bgLabelByLang = {
+        ru: bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg,
+        es: bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg,
+        de: bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg,
+        fr: bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg,
+        en: bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg
+      };
+      bgLine = `${bgLabelByLang[baseLang] || labels.card_weekly_bg}: ${bgSentence}`;
+    }
+    dayTactics = `${bridgePrefix}${aspectLine}${bgLine ? ` ${bgLine}` : ''}`.trim();
+  } else {
+    const signFocusByLang = {
+      ru: `Фокус знака ${signRuGen}: ${zodiacHint}.`,
+      es: `Enfoque lunar en ${signName}: ${zodiacHint}.`,
+      de: `Fokus im Zeichen ${signName}: ${zodiacHint}.`,
+      fr: `Focus de la Lune en ${signName} : ${zodiacHint}.`,
+      en: `Moon focus in ${signName}: ${zodiacHint}.`
+    };
+    dayTactics = `${bridgePrefix}${signFocusByLang[baseLang] || signFocusByLang.en}`.trim();
+  }
+  const dayText = [dayTactics, tips.day].filter(Boolean).join(' ');
+
+  // 3. Evening text
+  const transitionNoteByLang = {
+    ru: `Смена лунных суток — в ${transitionTimeStr}.`,
+    es: `Cambio de día lunar a las ${transitionTimeStr}.`,
+    de: `Wechsel des Mondtags um ${transitionTimeStr}.`,
+    fr: `Changement de jour lunaire à ${transitionTimeStr}.`,
+    en: `Lunar day transitions at ${transitionTimeStr}.`
+  };
+  const lunarWrapByLang = {
+    ru: `Подведите итоги дня (${getRuOrdinalNumeric(activeLunarDay)} ${lunarDayFullLabel}). ${lunarDayNote}`,
+    es: `Cierra el balance del día (${activeLunarDay}.º ${lunarDayFullLabel}). ${lunarDayNote}`,
+    de: `Ziehen Sie Tagesbilanz (${activeLunarDay}. ${lunarDayFullLabel}). ${lunarDayNote}`,
+    fr: `Faites le bilan de la journée (${activeLunarDay}e ${lunarDayFullLabel}). ${lunarDayNote}`,
+    en: `Wrap up the day (${toEnglishOrdinal(activeLunarDay)} ${lunarDayFullLabel}). ${lunarDayNote}`
+  };
+  const wrapLine = lunarDayNote ? (lunarWrapByLang[baseLang] || lunarWrapByLang.en) : '';
+  const transLine = firstDay !== secondDay ? (transitionNoteByLang[baseLang] || transitionNoteByLang.en) : '';
+  const eveningText = [wrapLine, transLine, tips.evening].filter(Boolean).join(' ');
+
+  return [
+    { slot: 'morning', title: labels.slot_morning_title, text: morningText },
+    { slot: 'day', title: labels.slot_day_title, text: dayText },
+    { slot: 'evening', title: labels.slot_evening_title, text: eveningText }
+  ];
+}
+
+function renderHeroAndToday(dict) {
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const baseLang = lang.toLowerCase().split(/[-_]/)[0];
+  const now = new Date();
+  const todayStart = startOfDay(now);
+  const selectedStart = startOfDay(selectedDate);
+  const isToday = selectedStart.getTime() === todayStart.getTime();
+  const isPastDate = selectedStart.getTime() < todayStart.getTime();
+  const refMoment = isToday
+    ? now
+    : new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0, 0, 0);
+
+  const summary = getCalendarDayLunarSummary(selectedDate, refMoment);
+  const personal = appState.birthDate
+    ? computePersonalState(appState.birthDate, selectedDate, refMoment, appState.birthTime)
+    : null;
+
+  // Hero container background
+  const heroCard = document.getElementById('hero-card');
+  const bgHex = personal ? personal.headerColor : PHASE_COLORS.neutral;
+  heroCard.style.backgroundColor = bgHex;
+  document.documentElement.style.setProperty('--hero-bg', bgHex);
+
+  // Top-left: Moon illumination with 1 decimal place
+  document.getElementById('hero-illumination').textContent =
+    `${summary.phaseInfo.illuminationExact.toFixed(1)} %`;
+
+  // Bottom-left: Active alarm bell indicator
+  const alarmBtn = document.getElementById('btn-active-alarm');
+  if (appState.activeAlarm) {
+    alarmBtn.classList.remove('hidden');
+    alarmBtn.title = `${labels.hero_alarm_title}: ${appState.activeAlarm.text || labels.day_note_title}`;
+    alarmBtn.setAttribute('aria-label', labels.hero_alarm_aria);
+  } else {
+    alarmBtn.classList.add('hidden');
+    alarmBtn.title = labels.hero_alarm_title;
+    alarmBtn.setAttribute('aria-label', labels.hero_alarm_aria);
+  }
+
+  // Moon canvas
+  renderMoonCanvas(document.getElementById('moon-canvas'), summary.phaseInfo);
+
+  // Center top row: Moon age (X.X) + zodiac sign superscript + localized unit
+  const sign = summary.phaseInfo.zodiacSign;
+  const signName = getLocalizedZodiacSign(dict, sign);
+  document.getElementById('hero-day').textContent = summary.phaseInfo.moonAge.toFixed(1);
+  document.getElementById('hero-sup-top').textContent = signName;
+  document.getElementById('hero-age-unit').textContent = labels.moon_age_unit;
+
+  // Center bottom row: symmetrical lunar day pair with start time superscripts above both numbers
+  document.getElementById('hero-lunar-first').textContent = String(summary.firstDay);
+  document.getElementById('hero-lunar-second').textContent = String(summary.secondDay);
+  document.getElementById('hero-lunar-first-time').textContent = summary.firstDayStartTimeStr;
+  document.getElementById('hero-lunar-second-time').textContent = summary.secondDayStartTimeStr;
+  document.getElementById('hero-lunar-slot-first').classList.toggle('is-active', summary.activeIndex === 0);
+  document.getElementById('hero-lunar-slot-second').classList.toggle('is-active', summary.activeIndex === 1);
+
+  // Center third row: moonrise and moonset times for selected calendar day
+  document.getElementById('hero-moonrise').textContent = summary.moonriseStr || '--:--';
+  document.getElementById('hero-moonset').textContent = summary.moonsetStr || '--:--';
+
+  // Top-right trend glyph + exact 8-phase localized tooltip
+  const trendLabel = dict.moon_trends?.[summary.phaseInfo.trend] || '';
+  const detailedTrendLabel =
+    dict.moon_phase_names?.[summary.phaseInfo.detailedTrend] ||
+    trendLabel ||
+    labels.hero_trend_title;
+  const trendEl = document.getElementById('hero-trend');
+  trendEl.textContent = summary.phaseInfo.trendGlyph;
+  trendEl.title = detailedTrendLabel;
+  trendEl.setAttribute('aria-label', detailedTrendLabel);
+
+  // Context bar above timeline: "<Phase badge> · <Date>" in State B, "<Date>" in State A
+  const humanDate = formatHumanDate(selectedDate, lang);
+  const dateLabel = personal
+    ? `${dict.phases[personal.phaseKey]?.badge || ''} · ${humanDate}`
+    : (isToday ? `${labels.label_today} · ${humanDate}` : humanDate);
+  document.getElementById('selected-date-label').textContent = dateLabel;
+  document.getElementById('btn-back-today').classList.toggle('hidden', isToday);
+
+  const zodiacHint = dict.zodiac_hints?.[sign] || '';
+  const lunarDayNote = dict.lunar_days?.[String(summary.activeLunarDay)] || '';
+  const dayStatus = resolveDayStatus(personal, summary, dict, labels);
+
+  const phaseKeyForTips = personal
+    ? personal.phaseKey
+    : mapGuestPhaseKey(summary.phaseInfo.detailedTrend);
+  const dayInPhaseForTips = personal ? personal.phaseStage.dayInPhase : 1;
+
+  const tips = {
+    morning: getRotatedLifestyleTip(dict, phaseKeyForTips, 'morning', summary.activeLunarDay, dayInPhaseForTips),
+    day: getRotatedLifestyleTip(dict, phaseKeyForTips, 'day', summary.activeLunarDay, dayInPhaseForTips),
+    evening: getRotatedLifestyleTip(dict, phaseKeyForTips, 'evening', summary.activeLunarDay, dayInPhaseForTips)
+  };
+
+  let phaseTitle = '';
+  let profileTitle = '';
+  let ageTitle = '';
+  let phaseDayNote = '';
+  let roleHint = '';
+  let bridgeText = '';
+  let edgeDetail = null;
+  let bgDetail = null;
+
+  if (personal) {
+    const phaseObj = dict.phases[personal.phaseKey];
+    const profileObj = dict.profiles[personal.profileKey];
+    const roleObj = dict.roles[personal.roleKey];
+    const ageObj = dict.age_classes[personal.ageClassKey];
+    phaseTitle = phaseObj?.title || '';
+    profileTitle = profileObj?.title || '';
+    ageTitle = ageObj?.title || '';
+    phaseDayNote =
+      dict.phase_day_notes?.[personal.phaseKey]?.[personal.phaseStage.key] ||
+      personal.phaseStage.hint;
+    roleHint = roleObj?.hint || '';
+    bridgeText = buildHarmonyBridge(personal, sign, personal.dailyFocusEdge, dict);
+
+    if (personal.dailyFocusEdge) {
+      const top = personal.dailyFocusEdge;
+      const actor = dict.actors[top.actorKey] || dict.actors.actor_moon;
+      const maneuver = dict.maneuvers[top.aspectKey];
+      edgeDetail = {
+        actorTitle: actor.title,
+        maneuverTitle: maneuver?.title || '',
+        scenarioAdvice: getEdgeScenarioAdvice(dict, top),
+        dynamicText: dict.aspect_dynamics?.[top.dynamicKey] || ''
+      };
+    }
+
+    if (personal.backgroundEdge) {
+      const bg = personal.backgroundEdge;
+      const bgActor = dict.actors[bg.actorKey] || dict.actors.actor_outer;
+      const bgManeuver = dict.maneuvers[bg.aspectKey];
+      bgDetail = {
+        actorTitle: bgActor.title,
+        maneuverTitle: bgManeuver?.title || '',
+        advice: getEdgeScenarioAdvice(dict, bg),
+        isExact: personal.isBackgroundExactPeak
+      };
+    }
+  }
+
+  const hasWarning = Boolean(
+    personal?.dailyFocusEdge &&
+    dict.maneuvers?.[personal.dailyFocusEdge.aspectKey]?.valence === 'warning'
+  );
+
+  const introParagraph = buildTodayIntroText(baseLang, {
+    isToday,
+    isPersonal: Boolean(personal),
+    statusKey: dayStatus.key,
+    hasWarning,
+    phaseKey: personal?.phaseKey,
+    phaseTitle,
+    dayInPhase: personal?.phaseStage?.dayInPhase || 1,
+    totalDays: personal?.phaseStage?.totalDays || 8,
+    profileTitle,
+    ageTitle,
+    activeLunarDay: summary.activeLunarDay,
+    lunarDayFullLabel: labels.lunar_day_full,
+    canonicalSign: sign,
+    signName,
+    zodiacHint,
+    detailedTrendLabel,
+    illuminationStr: summary.phaseInfo.illuminationExact.toFixed(1)
+  });
+
+  // Today cards container: 1 unified summary intro block + 3 Morning/Day/Evening cards
+  const cardsEl = document.getElementById('today-cards');
+  cardsEl.innerHTML = '';
+
+  const summaryCard = document.createElement('article');
+  summaryCard.className = 'surface-card today-summary-card';
+  const summaryHeading = personal ? labels.today_course_heading : labels.today_guest_heading;
+  summaryCard.innerHTML = `
+    <div class="card-title"></div>
+    <p class="today-summary-text"></p>
+  `;
+  summaryCard.querySelector('.card-title').textContent = summaryHeading;
+  summaryCard.querySelector('.today-summary-text').textContent = introParagraph;
+  cardsEl.appendChild(summaryCard);
+
+  const slotCards = buildSlotCardsData(baseLang, {
+    labels,
+    isPersonal: Boolean(personal),
+    phaseDayNote,
+    roleHint,
+    bridgeText,
+    edgeDetail,
+    bgDetail,
+    canonicalSign: sign,
+    signName,
+    zodiacHint,
+    detailedTrendLabel,
+    activeLunarDay: summary.activeLunarDay,
+    lunarDayFullLabel: labels.lunar_day_full,
+    lunarDayNote,
+    firstDay: summary.firstDay,
+    secondDay: summary.secondDay,
+    transitionTimeStr: summary.transitionTimeStr,
+    tips
+  });
+
+  const activeSlot = personal ? personal.timeSlot : getTimeSlot(now);
+  const slotOrder = ['morning', 'day', 'evening'];
+  const activeSlotIdx = slotOrder.indexOf(activeSlot);
+
+  slotCards.forEach((item, idx) => {
+    const slotCard = document.createElement('article');
+    let stateClass = '';
+    if (isToday) {
+      if (idx === activeSlotIdx) stateClass = ' is-active';
+      else if (idx < activeSlotIdx) stateClass = ' is-past';
+    } else if (isPastDate) {
+      stateClass = ' is-past';
+    }
+    slotCard.className = `surface-card slot-card${stateClass}`;
+    slotCard.innerHTML = `
+      <div class="slot-card-title"></div>
+      <p class="card-desc"></p>
+    `;
+    slotCard.querySelector('.slot-card-title').textContent = item.title;
+    slotCard.querySelector('.card-desc').textContent = item.text;
+    cardsEl.appendChild(slotCard);
+  });
+}
+
+function getRemindersForDate(dateObj, activeLunarDay) {
+  const iso = toISODate(dateObj);
+  return appState.reminders.filter(r => {
+    if (!r.enabled) return false;
+    if (r.mode === 'date' && r.dateISO === iso) return true;
+    if (r.mode === 'lunar') {
+      if (r.repeatMonthly && r.lunarDay === activeLunarDay) return true;
+      if (r.nextTriggerAt && toISODate(new Date(r.nextTriggerAt)) === iso) return true;
+    }
+    return false;
+  });
+}
+
+function renderTimelineStrip(dict) {
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const strip = document.getElementById('lunar-timeline-strip');
+  strip.innerHTML = '';
+
+  const today = startOfDay(new Date());
+  const fragment = document.createDocumentFragment();
+  let selectedCellEl = null;
+
+  for (let offset = -30; offset <= 30; offset++) {
+    // Evaluate each timeline cell strictly at 21:00 local time so lunar day numbers progress cleanly
+    const cellDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset, 21, 0, 0, 0);
+    const isTodayCell = offset === 0;
+    const isSelectedCell = isSameCalendarDay(cellDate, selectedDate);
+
+    const summary = getCalendarDayLunarSummary(cellDate, cellDate);
+    const personal = appState.birthDate
+      ? computePersonalState(appState.birthDate, cellDate, cellDate, appState.birthTime)
+      : null;
+
+    const matchingReminders = getRemindersForDate(cellDate, summary.activeLunarDay);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'timeline-cell';
+    if (isTodayCell) btn.classList.add('is-today');
+    if (isSelectedCell) {
+      btn.classList.add('is-selected');
+      selectedCellEl = btn;
+    }
+    btn.setAttribute('role', 'option');
+    btn.setAttribute('aria-selected', String(isSelectedCell));
+
+    if (matchingReminders.length) {
+      const dot = document.createElement('span');
+      dot.className = 'tl-reminder-dot';
+      dot.title = labels.timeline_has_reminder;
+      btn.appendChild(dot);
+    }
+
+    const dateSpan = document.createElement('span');
+    dateSpan.className = 'tl-date tabular-nums';
+    dateSpan.textContent = formatShortDate(cellDate, lang);
+    btn.appendChild(dateSpan);
+
+    btn.appendChild(createMiniMoonCanvas(summary.phaseInfo));
+
+    const lunarSpan = document.createElement('span');
+    lunarSpan.className = 'tl-lunar-day tabular-nums';
+    lunarSpan.textContent = String(summary.activeLunarDay);
+    btn.appendChild(lunarSpan);
+
+    if (personal) {
+      const bar = document.createElement('span');
+      bar.className = 'tl-phase-bar';
+      bar.style.background = personal.headerColor;
+      btn.appendChild(bar);
+    }
+
+    btn.addEventListener('click', () => {
+      selectedDate = startOfDay(cellDate);
+      renderHeroAndToday(getActiveDictionary());
+      renderTimelineStrip(getActiveDictionary());
+      openDayNotePanel(cellDate, summary, personal);
+    });
+
+    fragment.appendChild(btn);
+  }
+
+  strip.appendChild(fragment);
+
+  if (selectedCellEl) {
+    requestAnimationFrame(() => {
+      selectedCellEl.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
+    });
+  }
+}
+
+function openDayNotePanel(dateObj, summary, personal) {
+  dayNoteTargetDate = startOfDay(dateObj);
+  const dict = getActiveDictionary();
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const panel = document.getElementById('day-note-panel');
+  panel.classList.remove('hidden');
+
+  document.getElementById('day-note-title').textContent = formatHumanDate(dateObj, lang);
+  const phaseLabel = personal
+    ? ` · ${dict.phases[personal.phaseKey]?.title || ''}`
+    : '';
+  const signName = getLocalizedZodiacSign(dict, summary.phaseInfo.zodiacSign);
+  document.getElementById('day-note-meta').textContent =
+    `${summary.activeLunarDay} ${labels.lunar_day_full} · ${signName}${phaseLabel}`;
+
+  const existingWrap = document.getElementById('day-note-existing');
+  const existing = getRemindersForDate(dateObj, summary.activeLunarDay);
+  existingWrap.innerHTML = '';
+
+  existing.forEach(rem => {
+    const row = document.createElement('div');
+    row.className = 'day-note-item';
+    const textSpan = document.createElement('span');
+    textSpan.textContent = rem.text;
+    const speakBtn = document.createElement('button');
+    speakBtn.type = 'button';
+    speakBtn.className = 'icon-btn-tiny';
+    speakBtn.textContent = labels.btn_speak;
+    speakBtn.addEventListener('click', () => {
+      speakText(rem.text, labels.reminder_prefix_tts);
+    });
+    row.append(textSpan, speakBtn);
+    existingWrap.appendChild(row);
+  });
+
+  document.getElementById('day-note-input').value = '';
+}
+
+function renderRemindersList(dict) {
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const container = document.getElementById('reminders-list');
+  container.innerHTML = '';
+
+  if (!appState.reminders.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = labels.reminders_empty;
+    container.appendChild(empty);
+    return;
+  }
+
+  appState.reminders.forEach(rem => {
+    const item = document.createElement('article');
+    item.className = `reminder-item ${rem.enabled ? '' : 'is-disabled'}`;
+
+    const nextDateStr = rem.nextTriggerAt
+      ? formatHumanDate(new Date(rem.nextTriggerAt), lang)
+      : rem.dateISO || '';
+    const modeLabel =
+      rem.mode === 'lunar'
+        ? `${rem.lunarDay} ${labels.lunar_day_short}${rem.repeatMonthly ? ` · ${labels.label_every_month}` : ''}`
+        : `${rem.dateISO} (${rem.lunarDay} ${labels.lunar_day_short})`;
+
+    item.innerHTML = `
+      <div class="reminder-head">
+        <span class="reminder-meta tabular-nums">${modeLabel} · ${nextDateStr}</span>
+        <div class="reminder-controls">
+          <button type="button" class="icon-btn-tiny" data-act="speak">${labels.btn_speak}</button>
+          <button type="button" class="icon-btn-tiny" data-act="toggle">${rem.enabled ? labels.btn_toggle_off : labels.btn_toggle_on}</button>
+          <button type="button" class="icon-btn-tiny danger" data-act="delete">${labels.btn_delete}</button>
+        </div>
+      </div>
+      <p class="reminder-text"></p>
+    `;
+    item.querySelector('.reminder-text').textContent = rem.text;
+
+    item.querySelector('[data-act="speak"]').addEventListener('click', () => {
+      speakText(rem.text, labels.reminder_prefix_tts);
+    });
+    item.querySelector('[data-act="toggle"]').addEventListener('click', async () => {
+      const updated = appState.reminders.map(r =>
+        r.id === rem.id ? { ...r, enabled: !r.enabled } : r
+      );
+      appState.reminders = updated;
+      await extBridge.saveState({ reminders: updated });
+      renderUI();
+    });
+    item.querySelector('[data-act="delete"]').addEventListener('click', async () => {
+      const updated = appState.reminders.filter(r => r.id !== rem.id);
+      appState.reminders = updated;
+      await extBridge.saveState({ reminders: updated });
+      renderUI();
+    });
+
+    container.appendChild(item);
+  });
+}
+
+function renderSettingsPanel(dict) {
+  const labels = getUILabels(dict);
+  const birthInput = document.getElementById('input-birth-date');
+  birthInput.value = appState.birthDate || '';
+  document.getElementById('input-birth-time').value = appState.birthTime || '';
+
+  const profileBox = document.getElementById('profile-summary-box');
+  if (appState.birthDate) {
+    const personal = computePersonalState(appState.birthDate, new Date(), new Date(), appState.birthTime);
+    const prof = dict.profiles[personal.profileKey];
+    const age = dict.age_classes[personal.ageClassKey];
+    profileBox.classList.remove('hidden');
+    profileBox.innerHTML = `
+      <strong>${prof.title}</strong> · ${age.title}<br/>
+      <span>${prof.short_desc} (${labels.label_birth_lunar_age}: ${personal.birthMoonAge.toFixed(1)} ${labels.moon_age_unit})</span>
+    `;
+  } else {
+    profileBox.classList.add('hidden');
+    profileBox.innerHTML = '';
+  }
+
+  document.getElementById('input-morning-enabled').checked = Boolean(
+    appState.notifications.morningEnabled
+  );
+  document.getElementById('input-day-enabled').checked = Boolean(
+    appState.notifications.dayEnabled
+  );
+  document.getElementById('input-evening-enabled').checked = Boolean(
+    appState.notifications.eveningEnabled
+  );
+  document.getElementById('input-alarm-push-enabled').checked = Boolean(
+    appState.notifications.alarmPushEnabled
+  );
+  document.getElementById('input-time-morning').value = appState.notifications.morning || '08:30';
+  document.getElementById('input-time-day').value = appState.notifications.day || '13:30';
+  document.getElementById('input-time-evening').value = appState.notifications.evening || '20:30';
+
+  // Built-in language & Dictionary switcher
+  document.getElementById('select-builtin-lang').value = appState.builtinLang || detectDefaultLang();
+  const btnDef = document.getElementById('dict-mode-default');
+  const btnCust = document.getElementById('dict-mode-custom');
+  btnDef.classList.toggle('active', appState.dictionaryMode === 'default');
+  btnCust.classList.toggle('active', appState.dictionaryMode === 'custom');
+
+  const metaBox = document.getElementById('dict-meta-info');
+  metaBox.innerHTML = `
+    <strong>${escapeHtml(dict.meta?.name || labels.app_title)}</strong> · ${escapeHtml(labels.label_dict_lang)}: <code>${escapeHtml(dict.meta?.lang || 'ru-RU')}</code><br/>
+    <span>${escapeHtml(dict.meta?.description || '')}</span>
+  `;
+
+  populateVoiceSelector();
+}
+
+function populateVoiceSelector() {
+  const select = document.getElementById('select-voice');
+  const voices = getVoicesList();
+  const dict = getActiveDictionary();
+  const labels = getUILabels(dict);
+  const langPrefix = (dict.meta?.lang || 'ru-RU').split('-')[0].toLowerCase();
+
+  select.innerHTML = '';
+
+  const autoOpt = document.createElement('option');
+  autoOpt.value = '';
+  autoOpt.textContent = `${labels.label_voice_auto} (${dict.meta?.lang || 'ru-RU'})`;
+  select.appendChild(autoOpt);
+
+  const sorted = [...voices].sort((a, b) => {
+    const aMatch = a.lang.toLowerCase().startsWith(langPrefix) ? 0 : 1;
+    const bMatch = b.lang.toLowerCase().startsWith(langPrefix) ? 0 : 1;
+    if (aMatch !== bMatch) return aMatch - bMatch;
+    return a.name.localeCompare(b.name);
+  });
+
+  sorted.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v.voiceURI;
+    opt.textContent = `${v.name} (${v.lang})`;
+    select.appendChild(opt);
+  });
+
+  select.value = appState.selectedVoiceURI || '';
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// =========================================================================
+// Reminder Calculators & Form Helpers
+// =========================================================================
+function updateLunarDayNextPreview() {
+  const dict = getActiveDictionary();
+  const labels = getUILabels(dict);
+  const lang = dict.meta?.lang || 'ru-RU';
+  const dayNum = Number(document.getElementById('input-lunar-day').value) || 1;
+  const nextDate = findNextDateForLunarDay(dayNum, new Date());
+  document.getElementById('lunar-day-next-preview').textContent =
+    `${labels.label_nearest}: ${formatHumanDate(nextDate, lang)}, ${nextDate.toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+function updateCalendarDateCalcPreview() {
+  const dict = getActiveDictionary();
+  const labels = getUILabels(dict);
+  const val = document.getElementById('input-calendar-date').value;
+  const box = document.getElementById('date-calc-preview');
+  const parsed = parseBirthDateString(val);
+  if (!parsed) {
+    box.textContent = labels.label_select_date_preview;
+    return;
+  }
+  const summary = getCalendarDayLunarSummary(parsed, parsed);
+  const personal = appState.birthDate
+    ? computePersonalState(appState.birthDate, parsed, parsed, appState.birthTime)
+    : null;
+  const signName = getLocalizedZodiacSign(dict, summary.phaseInfo.zodiacSign);
+  const phasePart = personal ? ` · ${labels.label_phase_prefix}: ${dict.phases[personal.phaseKey]?.title}` : '';
+  box.textContent =
+    `${summary.activeLunarDay} ${labels.lunar_day_full} (${signName}, ${summary.phaseInfo.illuminationExact.toFixed(1)}%)${phasePart}`;
+}
+
+// =========================================================================
+// Notify Preview Host (when embedded in AI Studio web workbench)
+// =========================================================================
+function notifyPreviewHost() {
+  if (HAS_CHROME_EXT || window.parent === window) return;
+  const now = new Date();
+  const dict = getActiveDictionary();
+  const summary = getCalendarDayLunarSummary(now, now);
+  const personal = appState.birthDate
+    ? computePersonalState(appState.birthDate, now, now, appState.birthTime)
+    : null;
+  const hasAlarm = Boolean(appState.activeAlarm);
+  window.parent.postMessage(
+    {
+      type: 'LUNAR_EXT_STATE',
+      badgeText: hasAlarm ? '🔔' : String(summary.activeLunarDay),
+      badgeColor: hasAlarm
+        ? ACTIVE_ALARM_BADGE_COLOR
+        : personal
+        ? personal.headerColor
+        : PHASE_COLORS.neutral,
+      mode: personal ? 'B' : 'A',
+      zodiac: getLocalizedZodiacSign(dict, summary.phaseInfo.zodiacSign)
+    },
+    '*'
+  );
+}
+
+// =========================================================================
+// Event Wiring & Initialization
+// =========================================================================
+function bindEvents() {
+  // Bottom Navigation Tabs
+  document.querySelectorAll('.nav-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      activeTab = btn.dataset.tab;
+      document.querySelectorAll('.nav-tab').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tab-panel').forEach(panel => {
+        panel.classList.toggle('active', panel.id === `tab-${activeTab}`);
+      });
+    });
+  });
+
+  // Return to Today button
+  const resetToToday = () => {
+    selectedDate = startOfDay(new Date());
+    document.getElementById('day-note-panel').classList.add('hidden');
+    renderUI();
+  };
+  document.getElementById('btn-back-today').addEventListener('click', resetToToday);
+
+  // Active Alarm Bell (top-left of hero): dismiss alarm, restore badge, and speak reminder
+  document.getElementById('btn-active-alarm').addEventListener('click', async () => {
+    if (!appState.activeAlarm) return;
+    const dict = getActiveDictionary();
+    const alarmText = appState.activeAlarm.text || '';
+    appState.activeAlarm = null;
+    await extBridge.saveState({ activeAlarm: null });
+    renderUI();
+    await speakText(alarmText, dict.ui_labels.reminder_prefix_tts);
+  });
+
+  // Copy External AI Prompt (compact 28x28 icon expanding into 2s confirmation pill)
+  const copyPromptBtn = document.getElementById('btn-copy-ai-prompt');
+  const copyPromptLabel = document.getElementById('hero-prompt-label');
+  copyPromptBtn.addEventListener('click', async () => {
+    const labels = getUILabels();
+    const promptText = buildExternalAIPrompt();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(promptText);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = promptText;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+
+    if (copyPromptResetTimer) clearTimeout(copyPromptResetTimer);
+    copyPromptLabel.textContent = labels.prompt_copied_toast;
+    copyPromptBtn.classList.add('is-copied');
+    copyPromptResetTimer = setTimeout(() => {
+      copyPromptBtn.classList.remove('is-copied');
+      copyPromptResetTimer = null;
+    }, 2000);
+  });
+
+  // Speak Briefing & Stop
+  document.getElementById('btn-speak-briefing').addEventListener('click', () => {
+    speakText(buildBriefingSpeechText());
+  });
+  document.getElementById('btn-stop-speech').addEventListener('click', () => {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    document.getElementById('btn-stop-speech').classList.add('hidden');
+  });
+
+  // Day Note Drawer
+  document.getElementById('btn-close-day-note').addEventListener('click', () => {
+    document.getElementById('day-note-panel').classList.add('hidden');
+  });
+  document.getElementById('btn-save-day-note').addEventListener('click', async () => {
+    const input = document.getElementById('day-note-input');
+    const text = input.value.trim();
+    if (!text || !dayNoteTargetDate) return;
+
+    const midday = new Date(
+      dayNoteTargetDate.getFullYear(),
+      dayNoteTargetDate.getMonth(),
+      dayNoteTargetDate.getDate(),
+      9, 0, 0, 0
+    );
+    const summary = getCalendarDayLunarSummary(dayNoteTargetDate, midday);
+    const newRem = {
+      id: `rem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      mode: 'date',
+      lunarDay: summary.activeLunarDay,
+      dateISO: toISODate(dayNoteTargetDate),
+      text,
+      repeatMonthly: false,
+      enabled: true,
+      nextTriggerAt: midday.getTime()
+    };
+
+    appState.reminders = [newRem, ...appState.reminders];
+    await extBridge.saveState({ reminders: appState.reminders });
+    input.value = '';
+    const personal = appState.birthDate
+      ? computePersonalState(appState.birthDate, dayNoteTargetDate, midday, appState.birthTime)
+      : null;
+    renderUI();
+    openDayNotePanel(dayNoteTargetDate, summary, personal);
+  });
+
+  // Reminders Tab: Form toggle & Mode switch
+  const formEl = document.getElementById('reminder-form');
+  document.getElementById('btn-toggle-reminder-form').addEventListener('click', () => {
+    formEl.classList.toggle('hidden');
+    updateLunarDayNextPreview();
+    updateCalendarDateCalcPreview();
+  });
+  document.getElementById('btn-cancel-reminder').addEventListener('click', () => {
+    formEl.classList.add('hidden');
+  });
+
+  document.querySelectorAll('#reminder-form .seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      reminderFormMode = btn.dataset.mode;
+      document.querySelectorAll('#reminder-form .seg-btn').forEach(b => b.classList.toggle('active', b === btn));
+      document.getElementById('mode-panel-lunar').classList.toggle('hidden', reminderFormMode !== 'lunar');
+      document.getElementById('mode-panel-date').classList.toggle('hidden', reminderFormMode !== 'date');
+    });
+  });
+
+  // Populate 1..30 lunar days dropdown
+  const lunarSelect = document.getElementById('input-lunar-day');
+  for (let d = 1; d <= 30; d++) {
+    const opt = document.createElement('option');
+    opt.value = String(d);
+    opt.textContent = `${d} лунные сутки`;
+    lunarSelect.appendChild(opt);
+  }
+  lunarSelect.addEventListener('change', updateLunarDayNextPreview);
+
+  const calInput = document.getElementById('input-calendar-date');
+  calInput.value = toISODate(new Date());
+  calInput.addEventListener('change', updateCalendarDateCalcPreview);
+
+  formEl.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = document.getElementById('input-reminder-text').value.trim();
+    if (!text) return;
+
+    let newRem;
+    if (reminderFormMode === 'lunar') {
+      const lunarDay = Number(lunarSelect.value) || 1;
+      const repeatMonthly = document.getElementById('input-repeat-monthly').checked;
+      const nextDate = findNextDateForLunarDay(lunarDay, new Date());
+      newRem = {
+        id: `rem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        mode: 'lunar',
+        lunarDay,
+        dateISO: toISODate(nextDate),
+        text,
+        repeatMonthly,
+        enabled: true,
+        nextTriggerAt: nextDate.getTime()
+      };
+    } else {
+      const dateStr = calInput.value || toISODate(new Date());
+      const parsed = parseBirthDateString(dateStr) || new Date();
+      const targetAt = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 9, 0, 0, 0);
+      const summary = getCalendarDayLunarSummary(parsed, targetAt);
+      newRem = {
+        id: `rem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        mode: 'date',
+        lunarDay: summary.activeLunarDay,
+        dateISO: dateStr,
+        text,
+        repeatMonthly: false,
+        enabled: true,
+        nextTriggerAt: targetAt.getTime()
+      };
+    }
+
+    appState.reminders = [newRem, ...appState.reminders];
+    await extBridge.saveState({ reminders: appState.reminders });
+    document.getElementById('input-reminder-text').value = '';
+    formEl.classList.add('hidden');
+    renderUI();
+  });
+
+  // Settings Tab: Birth date & optional birth time
+  document.getElementById('input-birth-date').addEventListener('change', async (e) => {
+    appState.birthDate = e.target.value || null;
+    await extBridge.saveState({ birthDate: appState.birthDate });
+    renderUI();
+  });
+
+  document.getElementById('input-birth-time').addEventListener('change', async (e) => {
+    appState.birthTime = e.target.value || null;
+    await extBridge.saveState({ birthTime: appState.birthTime });
+    renderUI();
+  });
+
+  document.getElementById('btn-clear-birth').addEventListener('click', async () => {
+    appState.birthDate = null;
+    appState.birthTime = null;
+    await extBridge.saveState({ birthDate: null, birthTime: null });
+    renderUI();
+  });
+
+  // Notifications (3 independent checkpoint toggles + alarm push notifications)
+  const saveNotifs = async () => {
+    appState.notifications = {
+      morningEnabled: document.getElementById('input-morning-enabled').checked,
+      dayEnabled: document.getElementById('input-day-enabled').checked,
+      eveningEnabled: document.getElementById('input-evening-enabled').checked,
+      alarmPushEnabled: document.getElementById('input-alarm-push-enabled').checked,
+      morning: document.getElementById('input-time-morning').value || '08:30',
+      day: document.getElementById('input-time-day').value || '13:30',
+      evening: document.getElementById('input-time-evening').value || '20:30'
+    };
+    await extBridge.saveState({ notifications: appState.notifications });
+  };
+  document.getElementById('input-morning-enabled').addEventListener('change', saveNotifs);
+  document.getElementById('input-day-enabled').addEventListener('change', saveNotifs);
+  document.getElementById('input-evening-enabled').addEventListener('change', saveNotifs);
+  document.getElementById('input-alarm-push-enabled').addEventListener('change', saveNotifs);
+  document.getElementById('input-time-morning').addEventListener('change', saveNotifs);
+  document.getElementById('input-time-day').addEventListener('change', saveNotifs);
+  document.getElementById('input-time-evening').addEventListener('change', saveNotifs);
+
+  // Voice
+  document.getElementById('select-voice').addEventListener('change', async (e) => {
+    appState.selectedVoiceURI = e.target.value || '';
+    await extBridge.saveState({ selectedVoiceURI: appState.selectedVoiceURI });
+  });
+  document.getElementById('btn-test-voice').addEventListener('click', () => {
+    const dict = getActiveDictionary();
+    const sample = dict.phases?.phase_peak?.tts_summary || dict.meta?.tts_prefix || 'Проверка голоса.';
+    speakText(sample);
+  });
+
+  // Built-in language & Dictionaries
+  document.getElementById('select-builtin-lang').addEventListener('change', async (e) => {
+    const nextLang = BUILTIN_DICTIONARIES[e.target.value] ? e.target.value : detectDefaultLang();
+    appState.builtinLang = nextLang;
+    appState.selectedVoiceURI = '';
+    await extBridge.saveState({ builtinLang: nextLang, selectedVoiceURI: '' });
+    renderUI();
+  });
+
+  document.getElementById('dict-mode-default').addEventListener('click', async () => {
+    appState.dictionaryMode = 'default';
+    await extBridge.saveState({ dictionaryMode: 'default' });
+    renderUI();
+  });
+
+  document.getElementById('dict-mode-custom').addEventListener('click', async () => {
+    const labels = getUILabels();
+    const status = document.getElementById('dict-status-msg');
+    if (!appState.customDictionary) {
+      status.classList.remove('hidden');
+      status.classList.add('error');
+      status.textContent = labels.msg_upload_custom_first;
+      return;
+    }
+    status.classList.add('hidden');
+    appState.dictionaryMode = 'custom';
+    await extBridge.saveState({ dictionaryMode: 'custom' });
+    renderUI();
+  });
+
+  document.getElementById('btn-download-template').addEventListener('click', () => {
+    const baseDict = getActiveBaseDictionary();
+    const langCode = appState.builtinLang || detectDefaultLang();
+    const blob = new Blob([JSON.stringify(baseDict, null, 2)], {
+      type: 'application/json'
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `base_default_${langCode}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  document.getElementById('input-upload-dict').addEventListener('change', async (e) => {
+    const labels = getUILabels();
+    const file = e.target.files?.[0];
+    const status = document.getElementById('dict-status-msg');
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const validKeys = [
+        'meta', 'profiles', 'phases', 'phase_day_notes', 'roles', 'age_classes',
+        'actors', 'moon_trends', 'moon_phase_names', 'zodiac_names', 'zodiac_hints', 'lunar_days',
+        'aspect_dynamics', 'maneuvers', 'actor_maneuver_matrix', 'lifestyle_tips', 'ui_labels'
+      ];
+      const hasKnownSection =
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        validKeys.some(k => k in parsed);
+
+      if (!hasKnownSection) {
+        throw new Error('JSON does not contain valid dictionary sections.');
+      }
+
+      const merged = deepMergeDictionary(getActiveBaseDictionary(), parsed);
+      const nextLabels = getUILabels(merged);
+      appState.customDictionary = merged;
+      appState.dictionaryMode = 'custom';
+      await extBridge.saveState({
+        customDictionary: merged,
+        dictionaryMode: 'custom'
+      });
+
+      status.classList.remove('hidden', 'error');
+      status.textContent = `${nextLabels.msg_dict_loaded}: ${merged.meta?.name || file.name}`;
+      renderUI();
+    } catch (err) {
+      status.classList.remove('hidden');
+      status.classList.add('error');
+      status.textContent = `${labels.msg_dict_error}: ${err.message}`;
+    } finally {
+      e.target.value = '';
+    }
+  });
+
+  // Copy Raw Data (JSON) button in Settings
+  const copyRawBtn = document.getElementById('btn-copy-raw-data');
+  copyRawBtn.addEventListener('click', async () => {
+    const labels = getUILabels();
+    const now = new Date();
+    const isToday = isSameCalendarDay(selectedDate, now);
+    const refMoment = isToday
+      ? now
+      : new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0, 0, 0);
+
+    const rawPayload = computeRawDiagnosticData(
+      appState.birthDate,
+      appState.birthTime,
+      selectedDate,
+      refMoment
+    );
+    const jsonText = JSON.stringify(rawPayload, null, 2);
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(jsonText);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = jsonText;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+
+    if (copyRawResetTimer) clearTimeout(copyRawResetTimer);
+    copyRawBtn.textContent = labels.raw_data_copied_toast;
+    copyRawBtn.classList.add('is-copied');
+    copyRawResetTimer = setTimeout(() => {
+      copyRawBtn.classList.remove('is-copied');
+      copyRawBtn.textContent = getUILabels().btn_copy_raw_data;
+      copyRawResetTimer = null;
+    }, 2000);
+  });
+}
+
+async function handlePendingAutoplay() {
+  const params = new URLSearchParams(window.location.search);
+  const urlAutoplay = params.get('autoplay') === '1';
+  const pending = appState.pendingAutoplay;
+
+  if (!urlAutoplay && !pending) return;
+
+  if (pending) {
+    await extBridge.saveState({ pendingAutoplay: null });
+    appState.pendingAutoplay = null;
+  }
+
+  const dict = getActiveDictionary();
+  if (pending && pending.type === 'reminder' && pending.text) {
+    if (appState.activeAlarm) {
+      appState.activeAlarm = null;
+      await extBridge.saveState({ activeAlarm: null });
+      renderUI();
+    }
+    await speakText(pending.text, dict.ui_labels.reminder_prefix_tts);
+  } else {
+    await speakText(buildBriefingSpeechText());
+  }
+}
+
+async function init() {
+  if (HAS_CHROME_EXT) {
+    const raw = await chrome.storage.local.get(['builtinLang']);
+    if (!raw.builtinLang || !BUILTIN_DICTIONARIES[raw.builtinLang]) {
+      await chrome.storage.local.set({ builtinLang: detectDefaultLang() });
+    }
+  }
+  appState = await extBridge.loadState();
+  bindEvents();
+
+  if (HAS_CHROME_EXT && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener(async (changes, area) => {
+      if (area !== 'local') return;
+      if (changes.activeAlarm || changes.reminders || changes.birthDate || changes.birthTime || changes.builtinLang) {
+        appState = await extBridge.loadState();
+        renderUI();
+      }
+    });
+  }
+
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.onvoiceschanged = () => {
+      populateVoiceSelector();
+    };
+  }
+
+  renderUI();
+  await handlePendingAutoplay();
+}
+
+init();

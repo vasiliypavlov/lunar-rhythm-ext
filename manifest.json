@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Ритм Дня / Lunar Rhythm Navigator",
+  "short_name": "Ритм Дня",
+  "version": "1.0.0",
+  "description": "Автономный лунный календарь, персональный навигатор ритмов, граф аспектов и лунный будильник с голосовой сводкой.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "notifications"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ритм Дня",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
