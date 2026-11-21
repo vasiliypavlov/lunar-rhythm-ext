@@ -458,6 +458,22 @@ export function getCalendarDayLunarSummary(calendarDate, referenceMoment = null)
     ? formatHM(fromJulianDay(horizonEvents.sets[0]))
     : '--:--';
 
+  const mkWindow = (hour) => {
+    const dt = new Date(calendarDate.getFullYear(), calendarDate.getMonth(), calendarDate.getDate(), hour, 0, 0, 0);
+    const info = getMoonPhaseInfo(dt);
+    return {
+      hour,
+      zodiacSign: info.zodiacSign,
+      detailedTrend: info.detailedTrend,
+      moonLon: Number(info.moonLon.toFixed(2))
+    };
+  };
+  const windows = {
+    morning: mkWindow(9),
+    day: mkWindow(14),
+    evening: mkWindow(20)
+  };
+
   return {
     calendarDay: calendarDate.getDate(),
     activeLunarDay: activeInterval.day,
@@ -469,6 +485,7 @@ export function getCalendarDayLunarSummary(calendarDate, referenceMoment = null)
     transitionTimeStr,
     moonriseStr,
     moonsetStr,
+    windows,
     phaseInfo
   };
 }
@@ -945,13 +962,183 @@ function buildRawNonMoonEdges(natal, targetDateObj, refMoment) {
   return { fastEdges, backgroundEdges };
 }
 
+const ROLE_BASE_WEIGHTS = {
+  role_agile: 0.25,
+  role_drive: 0.20,
+  role_diplomat: 0.25,
+  role_heavy: 0.22,
+  role_autonomous: 0.32
+};
+
+const PHASE_ROLE_BIAS = {
+  phase_peak: { role_drive: 0.25, role_agile: 0.20, role_heavy: 0.18, role_diplomat: 0.15 },
+  phase_decline: { role_diplomat: 0.22, role_heavy: 0.25, role_autonomous: 0.22 },
+  phase_minimum: { role_autonomous: 0.45, role_diplomat: 0.15, role_heavy: 0.10, role_drive: -0.30, role_agile: -0.20 },
+  phase_rise: { role_agile: 0.25, role_drive: 0.18, role_diplomat: 0.20, role_heavy: 0.12 }
+};
+
+const SIGN_ROLE_BIAS = {
+  'Овен': { role_drive: 0.65 },
+  'Телец': { role_diplomat: 0.55, role_heavy: 0.30 },
+  'Близнецы': { role_agile: 0.65 },
+  'Рак': { role_autonomous: 0.70 },
+  'Лев': { role_drive: 0.45, role_diplomat: 0.30 },
+  'Дева': { role_agile: 0.45, role_heavy: 0.45 },
+  'Весы': { role_diplomat: 0.70 },
+  'Скорпион': { role_drive: 0.60, role_heavy: 0.20 },
+  'Стрелец': { role_drive: 0.40, role_diplomat: 0.35 },
+  'Козерог': { role_heavy: 0.85 },
+  'Водолей': { role_agile: 0.60 },
+  'Рыбы': { role_autonomous: 0.70 }
+};
+
+const TARGET_ROLE_BIAS = {
+  Mercury: { role_agile: 0.85 },
+  Venus: { role_diplomat: 0.85 },
+  Mars: { role_drive: 0.85 },
+  Sun: { role_drive: 0.42, role_heavy: 0.38 },
+  Moon: { role_autonomous: 0.42, role_diplomat: 0.36 }
+};
+
+const PHASE_CORRIDOR_GATE = {
+  phase_peak: { role_agile: 1.10, role_drive: 1.15, role_heavy: 1.05, role_diplomat: 1.00, role_autonomous: 0.75 },
+  phase_decline: { role_agile: 0.90, role_drive: 0.80, role_heavy: 1.18, role_diplomat: 1.10, role_autonomous: 1.02 },
+  phase_minimum: { role_agile: 0.55, role_drive: 0.40, role_heavy: 0.82, role_diplomat: 1.05, role_autonomous: 1.25 },
+  phase_rise: { role_agile: 1.12, role_drive: 1.05, role_heavy: 1.02, role_diplomat: 1.05, role_autonomous: 0.90 }
+};
+
+function findSolunarBaselineEdge(natal, targetDateObj, refMoment) {
+  const checkDate = refMoment || targetDateObj;
+  const laterDate = new Date(checkDate.getTime() + 2 * 3600000);
+  const moonNow = getMoonPosition(toJulianDay(checkDate)).lon;
+  const moonLater = getMoonPosition(toJulianDay(laterDate)).lon;
+  const targetLon = natal.Sun;
+
+  let bestAsp = ASPECTS[0];
+  let bestDiff = Infinity;
+  for (const asp of ASPECTS) {
+    const diff = getAngleDiffForPair(moonNow, targetLon, asp.angle);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestAsp = asp;
+    }
+  }
+
+  const diffLater = getAngleDiffForPair(moonLater, targetLon, bestAsp.angle);
+  const isApplying = diffLater < bestDiff;
+  const dynamicKey = bestDiff <= 1.2 ? 'exact' : isApplying ? 'applying' : 'separating';
+  const weight = Math.max(0.32, 0.52 * (1 - Math.min(bestDiff, 30) / 36));
+
+  return {
+    transit: 'Moon',
+    natal: 'Sun',
+    aspectKey: bestAsp.key,
+    angle: bestAsp.angle,
+    diff: Number(bestDiff.toFixed(2)),
+    weight: Number(weight.toFixed(4)),
+    actorKey: 'actor_moon',
+    layer: 'baseline',
+    isBaseline: true,
+    isApplying,
+    dynamicKey,
+    peakHour: checkDate.getHours()
+  };
+}
+
+export function scoreDailyRoles({
+  phaseKey,
+  moonSign,
+  natalMoonSign = null,
+  fastEdges = [],
+  backgroundEdges = [],
+  recentRoles = []
+}) {
+  const scores = { ...ROLE_BASE_WEIGHTS };
+
+  const pBias = PHASE_ROLE_BIAS[phaseKey] || {};
+  for (const [k, v] of Object.entries(pBias)) {
+    scores[k] = (scores[k] || 0) + v;
+  }
+
+  const sBias = SIGN_ROLE_BIAS[moonSign] || {};
+  for (const [k, v] of Object.entries(sBias)) {
+    scores[k] = (scores[k] || 0) + v;
+  }
+
+  if (natalMoonSign && moonSign === natalMoonSign) {
+    scores.role_autonomous += 0.55;
+  }
+
+  const consideredFast = fastEdges.slice(0, 3);
+  consideredFast.forEach((edge, idx) => {
+    const scale = idx === 0 ? 1.0 : idx === 1 ? 0.55 : 0.30;
+    const wNorm = Math.min(2.2, edge.weight || 0.5) / 1.6;
+    const tBias = TARGET_ROLE_BIAS[edge.natal] || {};
+    for (const [role, val] of Object.entries(tBias)) {
+      scores[role] = (scores[role] || 0) + val * scale * wNorm;
+    }
+    if (edge.aspectKey === 'edge_square' || edge.aspectKey === 'edge_opposition') {
+      scores.role_heavy += 0.20 * scale;
+    } else if (edge.aspectKey === 'edge_trine' || edge.aspectKey === 'edge_sextile') {
+      scores.role_diplomat += 0.14 * scale;
+    }
+  });
+
+  if (backgroundEdges.length > 0) {
+    const topBg = backgroundEdges[0];
+    if (topBg.actorKey === 'actor_saturn') {
+      scores.role_heavy += 0.42;
+    } else if (topBg.actorKey === 'actor_jupiter') {
+      scores.role_diplomat += 0.25;
+      scores.role_heavy += 0.15;
+    } else if (topBg.actorKey === 'actor_outer') {
+      scores.role_autonomous += 0.20;
+    }
+  }
+
+  const gate = PHASE_CORRIDOR_GATE[phaseKey] || {};
+  for (const k of Object.keys(scores)) {
+    scores[k] = Math.max(0.05, scores[k]) * (gate[k] || 1.0);
+  }
+
+  // Smooth lookback rotation penalty so roles do not stick for 3-4 days in a row
+  recentRoles.forEach((r, idx) => {
+    if (r && scores[r] !== undefined) {
+      scores[r] -= 0.42 * Math.pow(0.7, idx);
+    }
+  });
+
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  let winner = ranked[0][0];
+  const twoInRow = recentRoles.length >= 2 && recentRoles[0] === winner && recentRoles[1] === winner;
+  const swapThreshold = twoInRow ? 1.25 : 0.65;
+  if (
+    ranked.length > 1 &&
+    recentRoles.slice(0, 2).includes(winner) &&
+    ranked[0][1] - ranked[1][1] < swapThreshold
+  ) {
+    winner = ranked[1][0];
+  }
+
+  const roundedScores = {};
+  for (const [k, v] of Object.entries(scores)) {
+    roundedScores[k] = Number(v.toFixed(3));
+  }
+
+  return { roleKey: winner, scores: roundedScores };
+}
+
 export function buildLayeredAspectGraph(birthDateObj, targetDateObj, refMoment = targetDateObj) {
   const natal = getPlanetLongitudes(birthDateObj, NATAL_TARGETS);
+  const natalMoonSign = getZodiacSign(natal.Moon);
 
   const buildDayCandidates = (dayDate, dayRef) => {
     const moonEdges = findDailyMoonAspects(natal, dayDate, dayRef);
     const { fastEdges: planetaryFast, backgroundEdges } = buildRawNonMoonEdges(natal, dayDate, dayRef);
-    const combined = [...moonEdges, ...planetaryFast].sort((a, b) => b.weight - a.weight);
+    let combined = [...moonEdges, ...planetaryFast].sort((a, b) => b.weight - a.weight);
+    if (combined.length === 0) {
+      combined = [findSolunarBaselineEdge(natal, dayDate, dayRef)];
+    }
     return { moonEdges, planetaryFast, combined, backgroundEdges };
   };
 
@@ -959,10 +1146,10 @@ export function buildLayeredAspectGraph(birthDateObj, targetDateObj, refMoment =
   const prev2Date = new Date(targetDateObj.getFullYear(), targetDateObj.getMonth(), targetDateObj.getDate() - 2, 12, 0, 0, 0);
   const prev1Date = new Date(targetDateObj.getFullYear(), targetDateObj.getMonth(), targetDateObj.getDate() - 1, 12, 0, 0, 0);
 
-  const prev2Top = buildDayCandidates(prev2Date, prev2Date).combined[0] || null;
+  const prev2Raw = buildDayCandidates(prev2Date, prev2Date);
+  const prev2Top = prev2Raw.combined[0] || null;
   const prev1Raw = buildDayCandidates(prev1Date, prev1Date);
 
-  // Determine yesterday's actual winner after checking prev2 repetition
   const prev1Edges = prev1Raw.combined.map(edge => {
     let w = edge.weight;
     if (prev2Top && edge.transit !== 'Moon') {
@@ -974,7 +1161,6 @@ export function buildLayeredAspectGraph(birthDateObj, targetDateObj, refMoment =
   }).sort((a, b) => b.weight - a.weight);
   const yesterdayFocus = prev1Edges[0] || null;
 
-  // Score today's candidates with smooth repetition decay (0.65)
   const todayRaw = buildDayCandidates(targetDateObj, refMoment);
   const decayedFast = todayRaw.combined
     .map(edge => {
@@ -988,26 +1174,35 @@ export function buildLayeredAspectGraph(birthDateObj, targetDateObj, refMoment =
         } else if (wasActiveYesterday) {
           w *= 0.75;
         }
-        // Gentle attenuation after exact peak is passed so agenda shifts smoothly
         if (edge.dynamicKey === 'separating' && yesterdayFocus && edge.transit === yesterdayFocus.transit) {
           w *= 0.75;
         }
       } else if (yesterdayFocus && yesterdayFocus.transit === 'Moon') {
-        // Gently de-prioritize identical Moon aspect on consecutive days
         if (edge.aspectKey === yesterdayFocus.aspectKey && edge.natal === yesterdayFocus.natal) {
-          w *= 0.65;
+          w *= 0.62;
         } else if (edge.aspectKey === yesterdayFocus.aspectKey) {
-          w *= 0.8;
+          w *= 0.78;
         }
+      }
+      // If both prev1 and prev2 had the exact same aspectKey, apply gentle rotation pressure
+      if (prev2Top && yesterdayFocus && edge.aspectKey === yesterdayFocus.aspectKey && edge.aspectKey === prev2Top.aspectKey) {
+        w *= 0.70;
       }
       return { ...edge, weight: Number(w.toFixed(4)) };
     })
     .filter(edge => edge.transit === 'Moon' || edge.weight >= 0.42)
     .sort((a, b) => b.weight - a.weight);
 
+  // Guarantee non-empty daily focus via solunar baseline if filtering emptied planetary candidates
+  const finalFast = decayedFast.length > 0 ? decayedFast : [findSolunarBaselineEdge(natal, targetDateObj, refMoment)];
+
   return {
-    fastEdges: decayedFast,
-    backgroundEdges: todayRaw.backgroundEdges
+    fastEdges: finalFast,
+    backgroundEdges: todayRaw.backgroundEdges,
+    prev2Raw,
+    prev1Edges,
+    prev1Raw,
+    natalMoonSign
   };
 }
 
@@ -1016,7 +1211,17 @@ export function buildAspectGraph(birthDateObj, targetDateObj) {
   return [...fastEdges, ...backgroundEdges].sort((a, b) => b.weight - a.weight);
 }
 
-export function determineOperationalRole(phaseKey, topFastEdge) {
+export function determineOperationalRole(phaseKey, topFastEdge, extraCtx = null) {
+  if (extraCtx && extraCtx.moonSign) {
+    return scoreDailyRoles({
+      phaseKey,
+      moonSign: extraCtx.moonSign,
+      natalMoonSign: extraCtx.natalMoonSign || null,
+      fastEdges: extraCtx.fastEdges || (topFastEdge ? [topFastEdge] : []),
+      backgroundEdges: extraCtx.backgroundEdges || [],
+      recentRoles: extraCtx.recentRoles || []
+    }).roleKey;
+  }
   if (phaseKey === 'phase_minimum' && (!topFastEdge || topFastEdge.weight < 1.15)) {
     return 'role_autonomous';
   }
@@ -1068,12 +1273,49 @@ export function computePersonalState(
   const headerColor = PHASE_COLORS[phaseKey];
 
   const middayTarget = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 12, 0, 0, 0);
-  const { fastEdges, backgroundEdges } = buildLayeredAspectGraph(birthObj, middayTarget, momentForPhase);
+  const graph = buildLayeredAspectGraph(birthObj, middayTarget, momentForPhase);
+  const { fastEdges, backgroundEdges, prev2Raw, prev1Edges, prev1Raw, natalMoonSign } = graph;
   const dailyFocusEdge = fastEdges[0] || null;
   const backgroundEdge = backgroundEdges[0] || null;
   const isBackgroundExactPeak = Boolean(backgroundEdge && backgroundEdge.diff <= 0.25);
 
-  const roleKey = determineOperationalRole(phaseKey, dailyFocusEdge);
+  // Sequential role resolution for prev2 -> prev1 -> today to prevent multi-day role stagnation
+  const getPhaseAtDayOffset = (offsetDays) => {
+    const dt = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate() + offsetDays, 12, 0, 0, 0);
+    const info = getMoonPhaseInfo(dt);
+    const pp = ((info.moonAge - birthMoonAge) % SYNODIC_MONTH + SYNODIC_MONTH) % SYNODIC_MONTH;
+    return { phaseKey: getPersonalPhaseKey(pp), moonSign: info.zodiacSign };
+  };
+
+  const p2Info = getPhaseAtDayOffset(-2);
+  const rolePrev2 = scoreDailyRoles({
+    phaseKey: p2Info.phaseKey,
+    moonSign: p2Info.moonSign,
+    natalMoonSign,
+    fastEdges: prev2Raw.combined,
+    backgroundEdges: prev2Raw.backgroundEdges,
+    recentRoles: []
+  }).roleKey;
+
+  const p1Info = getPhaseAtDayOffset(-1);
+  const rolePrev1 = scoreDailyRoles({
+    phaseKey: p1Info.phaseKey,
+    moonSign: p1Info.moonSign,
+    natalMoonSign,
+    fastEdges: prev1Edges,
+    backgroundEdges: prev1Raw.backgroundEdges,
+    recentRoles: [rolePrev2]
+  }).roleKey;
+
+  const { roleKey, scores: roleScores } = scoreDailyRoles({
+    phaseKey,
+    moonSign: currentPhaseInfo.zodiacSign,
+    natalMoonSign,
+    fastEdges,
+    backgroundEdges,
+    recentRoles: [rolePrev1, rolePrev2]
+  });
+
   const timeSlot = getTimeSlot(momentForPhase);
 
   return {
@@ -1085,6 +1327,7 @@ export function computePersonalState(
     phaseStage,
     ageClassKey,
     roleKey,
+    roleScores,
     headerColor,
     fastEdges,
     backgroundEdges,
@@ -1177,6 +1420,7 @@ export function computeRawDiagnosticData(
         phaseStage: personal.phaseStage,
         ageClassKey: personal.ageClassKey,
         roleKey: personal.roleKey,
+        roleScores: personal.roleScores,
         timeSlot: personal.timeSlot,
         dailyFocusEdge: personal.dailyFocusEdge,
         backgroundEdge: personal.backgroundEdge,
@@ -1200,6 +1444,7 @@ export function computeRawDiagnosticData(
       moonLongitude: Number(summary.phaseInfo.moonLon.toFixed(4)),
       sunLongitude: Number(summary.phaseInfo.sunLon.toFixed(4)),
       moonZodiacSign: summary.phaseInfo.zodiacSign,
+      windows: summary.windows,
       activeLunarDay: summary.activeLunarDay,
       firstDay: summary.firstDay,
       firstDayStartTime: summary.firstDayStartTimeStr,

@@ -381,6 +381,130 @@ export const DICT_DE = {
       ]
     }
   },
+  "day_themes": {
+    "Овен": {
+      "title": "Direkter Start",
+      "focus": "Ein zügiger erster Schritt zählt heute mehr als überlange Vorbereitung."
+    },
+    "Телец": {
+      "title": "Stabiles Tempo",
+      "focus": "Stetige Ergebnisse bringen heute mehr als ein Sprint; bleiben Sie geerdet."
+    },
+    "Близнецы": {
+      "title": "Informationsfluss",
+      "focus": "Viele Kontakte und kurze Aufgaben; achten Sie besonders auf kleine Zusagen."
+    },
+    "Рак": {
+      "title": "Achtsamer Fokus",
+      "focus": "Ruhiges Arbeiten ohne Hektik; Familie, Zuhause und Wohlbefinden stehen vorn."
+    },
+    "Лев": {
+      "title": "Eigener Beitrag",
+      "focus": "Am besten gelingen Aufgaben, bei denen Ihre Eigenleistung klar sichtbar wird."
+    },
+    "Дева": {
+      "title": "Präzision & Ordnung",
+      "focus": "Detailprüfung, Checklisten und Routine leisten heute mehr als unnötiges Risiko."
+    },
+    "Весы": {
+      "title": "Abstimmung",
+      "focus": "Wichtige Entscheidungen hängen heute von Absprachen ab; suchen Sie faire Kompromisse."
+    },
+    "Скорпион": {
+      "title": "Tiefe & Kontrolle",
+      "focus": "Günstig für Ursachenanalyse und Ressourcensteuerung; Oberflächliches reicht nicht."
+    },
+    "Стрелец": {
+      "title": "Erweiterung",
+      "focus": "Lernen, Unterwegssein und frische Kontakte erweitern den Rahmen Ihrer Aufgabe."
+    },
+    "Козерог": {
+      "title": "Disziplin",
+      "focus": "Fristen, klare Struktur und Systemtreue zählen heute mehr als spontane Impulse."
+    },
+    "Водолей": {
+      "title": "Frischer Ansatz",
+      "focus": "Unkonventionelle Ideen und Flexibilität wirken besser als starre Schablonen."
+    },
+    "Рыбы": {
+      "title": "Ruhiger Fokus",
+      "focus": "Kreatives Nachdenken und Erholung wiegen heute schwerer als Zusatzpflichten."
+    }
+  },
+  "phase_variants": {
+    "phase_peak": [
+      "Heute ist Phase maximaler Ressource: ideale Zeit für Top-Prioritäten und entschlossenes Handeln.",
+      "Heute haben Sie starken Arbeitstonus: konzentrieren Sie sich auf das Wesentliche ohne Verzettelung.",
+      "Heute ist die Leistungsfähigkeit hoch: schaffen Sie mehr als üblich bei klarem Blick auf Fristen."
+    ],
+    "phase_decline": [
+      "Heute gilt ein ruhiger Rhythmus: Tempo drosseln, Ergebnisse sichern und Laufendes abschließen.",
+      "Heute passt moderate Last: Begonnenes fertigzustellen bringt mehr als neue Baustellen.",
+      "Heute zählt der Abschluss: Details prüfen und offene Prozesse sauber beenden."
+    ],
+    "phase_minimum": [
+      "Heute ist Erholungsmodus: keine harten Neustarts planen, Zeit für Schlaf und Pause reservieren.",
+      "Heute braucht es ein schonendes Maß: Kräfte sparen und Unnötiges aus dem Plan streichen.",
+      "Heute hilft ein leichter Zeitplan: Basisroutine halten und rechtzeitig ausruhen."
+    ],
+    "phase_rise": [
+      "Heute ist Aufbauphase: gute Zeit für Planung, Datensammlung und einen geordneten Einstieg.",
+      "Heute steht Vorbereitung vorn: Fakten sammeln und sichere Basis für nächste Schritte legen.",
+      "Heute steigt der Tonus allmählich: mit klarer Schrittfolge starten statt Tempo erzwingen."
+    ]
+  },
+  "role_tone": {
+    "role_agile": {
+      "phase_peak": "Voller Sprint-Takt: kurze Aufgabenfolgen mit regelmäßigem Blick auf das Hauptziel.",
+      "phase_decline": "Leicht erhöhtes Tempo: kurze Restpunkte klären, ohne neue Zweige aufzumachen.",
+      "phase_minimum": "Nur kurze, leichte Aufgabenpakete ohne Hektik oder Zusatzdruck.",
+      "phase_rise": "Bauen Sie Schwung in kurzen Etappen auf, ohne sich zu verzetteln."
+    },
+    "role_drive": {
+      "phase_peak": "Volle Eigeninitiative: Priorität übernehmen und Entscheidungen direkt voranbringen.",
+      "phase_decline": "Dosierte Initiative: einen wichtigen Schritt setzen und unnötige Debatten meiden.",
+      "phase_minimum": "Behutsame Initiative: kleine, sichere Schritte ohne abrupte Belastung.",
+      "phase_rise": "Die Initiative wächst stetig: mit einem klaren, machbaren ersten Schritt beginnen."
+    },
+    "role_diplomat": {
+      "phase_peak": "Aktive Verhandlungen: Kernpunkte abstimmen und Beteiligte auf ein Ziel ausrichten.",
+      "phase_decline": "Ein gezieltes Gespräch und ruhige Klärung der letzten Details.",
+      "phase_minimum": "Abstimmungen kurz und sachlich halten, lange Diskussionen vertagen.",
+      "phase_rise": "Der Dialog nimmt Fahrt auf: kommende Pläne frühzeitig abgleichen."
+    },
+    "role_heavy": {
+      "phase_peak": "Systematisches Arbeiten unter Volllast: Checklisten, Standards und Fristen nutzen.",
+      "phase_decline": "Geordneter Prüfblock: Unterlagen kontrollieren und bestehende Pflichten abschließen.",
+      "phase_minimum": "Ruhige Ordnung im Bestehenden halten, ohne schwere neue Zusagen einzugehen.",
+      "phase_rise": "Strukturierte Vorarbeit: Rahmen aufbauen und Ausgangsdaten prüfen."
+    },
+    "role_autonomous": {
+      "phase_peak": "Tiefe Einzelarbeit an Ihrer wichtigsten Aufgabe ohne Unterbrechungen.",
+      "phase_decline": "Ein ruhiger Konzentrationsblock ohne unnötige Telefonate.",
+      "phase_minimum": "Ruhiger, unaufgeregter Eigenrhythmus bei minimalen äußeren Anforderungen.",
+      "phase_rise": "Stille Startvorbereitung und geordnetes Sortieren eigener Ideen."
+    }
+  },
+  "window_focus": {
+    "morning": [
+      "Setzen Sie eine klare Hauptpriorität für heute",
+      "Sammeln Sie die Kernfakten für Ihre wichtigste Aufgabe",
+      "Kalender prüfen und Überflüssiges streichen",
+      "Eine kleine organisatorische Sache direkt klären"
+    ],
+    "day": [
+      "Kernzeitblock fest für die Prioritätsaufgabe reservieren",
+      "Geplante Telefonate und Abstimmungen durchführen",
+      "Unterlagen, Zahlen und laufende Fristen prüfen",
+      "Eine praktische Aufgabe mit aktivem Einsatz lösen"
+    ],
+    "evening": [
+      "Tagesbilanz ziehen und wichtigste Erkenntnisse festhalten",
+      "Kleine Restpunkte schließen und Kurzplan für morgen notieren",
+      "Ruhige Zeit für Zuhause und nahestehende Menschen einplanen",
+      "In ruhige Erholung ohne Arbeitsbildschirme wechseln"
+    ]
+  },
   "ui_labels": {
     "app_title": "Tagesrhythmus",
     "app_subtitle": "Lunar Rhythm Navigator",

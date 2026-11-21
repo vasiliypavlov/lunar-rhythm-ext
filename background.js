@@ -217,15 +217,22 @@ async function showCheckpointNotification(slot) {
     if (personal) {
       const phaseObj = dict.phases[personal.phaseKey];
       const rawTip = dict.lifestyle_tips[personal.phaseKey]?.[activeSlot];
+      const dateSeed = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
       let tip = '';
       if (Array.isArray(rawTip) && rawTip.length) {
-        const dayInPhase = personal.phaseStage?.dayInPhase || 1;
-        tip = rawTip[(summary.activeLunarDay + dayInPhase) % rawTip.length];
+        const seedStr = `${dateSeed}|${personal.phaseKey}|${activeSlot}|tip`;
+        let h = 2166136261;
+        for (let i = 0; i < seedStr.length; i++) {
+          h ^= seedStr.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        tip = rawTip[(h >>> 0) % rawTip.length];
       } else if (typeof rawTip === 'string') {
         tip = rawTip;
       }
+      const roleTone = dict.role_tone?.[personal.roleKey]?.[personal.phaseKey] || '';
       title = `${labels.app_title} · ${phaseObj.badge} (${summary.activeLunarDay} ${labels.lunar_day_short})`;
-      message = `${phaseObj.title}. ${tip}`.trim();
+      message = [phaseObj.title + '.', roleTone, tip].filter(Boolean).join(' ').trim();
     }
   }
 

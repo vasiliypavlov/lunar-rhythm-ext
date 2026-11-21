@@ -381,6 +381,130 @@ export const DICT_EN = {
       ]
     }
   },
+  "day_themes": {
+    "Овен": {
+      "title": "Direct Start",
+      "focus": "Taking a quick first step today matters more than over-polishing preparation."
+    },
+    "Телец": {
+      "title": "Steady Pace",
+      "focus": "Consistent output beats a sharp burst; stay grounded and avoid scattering effort."
+    },
+    "Близнецы": {
+      "title": "Information Flow",
+      "focus": "Expect lively messaging and short tasks; keep close track of small commitments."
+    },
+    "Рак": {
+      "title": "Careful Focus",
+      "focus": "Quiet work without rushing; family, home, and personal comfort come first."
+    },
+    "Лев": {
+      "title": "Personal Contribution",
+      "focus": "Work flows best where your individual ownership and visible output matter."
+    },
+    "Дева": {
+      "title": "Precision & Order",
+      "focus": "Detail checks, checklists, and steady routine pay off better than risky leaps."
+    },
+    "Весы": {
+      "title": "Alignment",
+      "focus": "Key choices depend on coordination today; look for balanced mutual agreements."
+    },
+    "Скорпион": {
+      "title": "Depth & Control",
+      "focus": "Suited for root-cause analysis and resource management; shallow fixes fall short."
+    },
+    "Стрелец": {
+      "title": "Expansion",
+      "focus": "Learning, travel, and fresh contacts help broaden the scope of your work."
+    },
+    "Козерог": {
+      "title": "Discipline",
+      "focus": "Deadlines, clear structure, and reliable systems outweigh spontaneous impulses."
+    },
+    "Водолей": {
+      "title": "Fresh Approach",
+      "focus": "Unconventional solutions and flexible choices work better than rigid templates."
+    },
+    "Рыбы": {
+      "title": "Calm Focus",
+      "focus": "Creative reflection and recovery matter more today than extra obligations."
+    }
+  },
+  "phase_variants": {
+    "phase_peak": [
+      "Today is the peak resource phase: ideal timing for top priorities and decisive progress.",
+      "Today offers strong working stamina: focus on what matters most without scattering attention.",
+      "Today brings high output capacity: accomplish more while keeping clear deadlines in view."
+    ],
+    "phase_decline": [
+      "Today follows a steady pacing rhythm: ease the tempo, log results, and close active items.",
+      "Today carries a moderate workload: finishing ongoing work beats opening new fronts.",
+      "Today favors completion: double-check details and bring active processes to a clean finish."
+    ],
+    "phase_minimum": [
+      "Today is recovery mode: avoid demanding new launches and reserve time for rest and sleep.",
+      "Today calls for gentle pacing: reserves are modest, so trim non-essential items from your schedule.",
+      "Today works best when you lighten your agenda, keep simple routines, and rest on time."
+    ],
+    "phase_rise": [
+      "Today is the momentum-building phase: strong timing for planning, research, and an orderly start.",
+      "Today centers on preparation: gather facts and build solid footing for upcoming decisions.",
+      "Today brings rising working tone: start with step-by-step structure without forcing speed."
+    ]
+  },
+  "role_tone": {
+    "role_agile": {
+      "phase_peak": "Full sprint cadence: tight task sequences with regular check-ins on your main goal.",
+      "phase_decline": "Slightly brisk pace: clear short loose ends without opening new branches.",
+      "phase_minimum": "Only brief, light task batches with zero rush or extra pressure.",
+      "phase_rise": "Build momentum in short bursts without scattering your focus."
+    },
+    "role_drive": {
+      "phase_peak": "Initiative at full strength: own the priority item and move decisions forward directly.",
+      "phase_decline": "Measured initiative: take one decisive step and skip unnecessary arguments.",
+      "phase_minimum": "Unhurried initiative: stick to small, safe steps with zero sudden spikes.",
+      "phase_rise": "Initiative is rising steadily: start with one clear, manageable first move."
+    },
+    "role_diplomat": {
+      "phase_peak": "Active negotiations: align key terms and rally people around shared outcomes.",
+      "phase_decline": "One well-timed conversation and calm alignment on remaining details.",
+      "phase_minimum": "Keep coordination brief and neutral, skipping drawn-out debates.",
+      "phase_rise": "Dialogue is picking up: discuss upcoming plans and align expectations early."
+    },
+    "role_heavy": {
+      "phase_peak": "Systematic execution at full scale: lean on checklists, standards, and deadlines.",
+      "phase_decline": "Methodical review block: verify paperwork and close existing commitments.",
+      "phase_minimum": "Stick to quiet order in current files without adding heavy new obligations.",
+      "phase_rise": "Structured groundwork: organize your framework and verify source inputs."
+    },
+    "role_autonomous": {
+      "phase_peak": "Deep solo work on your highest-impact deliverable without interruptions.",
+      "phase_decline": "One calm block of focused work without unnecessary calls.",
+      "phase_minimum": "Quiet, unhurried solo rhythm with minimal external demands.",
+      "phase_rise": "Quiet pre-launch preparation and calm organization of ideas."
+    }
+  },
+  "window_focus": {
+    "morning": [
+      "Set one clear priority for the day",
+      "Gather key facts for your main task",
+      "Review your schedule and trim clutter",
+      "Clear one simple organizational detail"
+    ],
+    "day": [
+      "Dedicate your core time block to the priority task",
+      "Handle scheduled calls and key alignments",
+      "Audit documents, figures, and active deadlines",
+      "Tackle a hands-on task requiring active engagement"
+    ],
+    "evening": [
+      "Review the day and capture key takeaways",
+      "Close minor open loops and draft a brief plan for tomorrow",
+      "Spend relaxed time with home and close ones",
+      "Ease into quiet rest away from work screens"
+    ]
+  },
   "ui_labels": {
     "app_title": "Daily Rhythm",
     "app_subtitle": "Lunar Rhythm Navigator",
