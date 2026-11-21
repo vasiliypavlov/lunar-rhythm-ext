@@ -586,6 +586,8 @@ export const DICT_FR = {
     "settings_rhythm_title": "Rythme Personnel (État B)",
     "settings_rhythm_desc": "Sans date de naissance, l'extension agit comme un calendrier lunaire précis. Indiquez votre date de naissance pour calculer vos phases et aspects.",
     "label_birth_date": "Date de naissance",
+    "placeholder_birth_date": "jj.mm.aaaa",
+    "btn_pick_date": "Choisir une date dans le calendrier",
     "label_birth_time": "Heure de naissance",
     "title_birth_time": "Heure de naissance (facultative, 12:00 par défaut)",
     "label_birth_lunar_age": "âge lunaire natal",

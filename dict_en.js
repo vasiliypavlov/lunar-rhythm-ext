@@ -586,6 +586,8 @@ export const DICT_EN = {
     "settings_rhythm_title": "Personal Rhythm (State B)",
     "settings_rhythm_desc": "Without a birth date, the app runs as a precise lunar calendar. Add your birth date to compute personal phases and the aspect graph.",
     "label_birth_date": "Birth date",
+    "placeholder_birth_date": "dd.mm.yyyy",
+    "btn_pick_date": "Choose date from calendar",
     "label_birth_time": "Birth time",
     "title_birth_time": "Birth time (optional, defaults to 12:00)",
     "label_birth_lunar_age": "natal lunar age",

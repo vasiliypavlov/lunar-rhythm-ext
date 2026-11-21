@@ -586,6 +586,8 @@ export const DICT_DE = {
     "settings_rhythm_title": "Persönlicher Rhythmus (Zustand B)",
     "settings_rhythm_desc": "Ohne Geburtsdatum arbeitet die App als präziser Mondkalender. Geben Sie Ihr Geburtsdatum für persönliche Phasen und Aspekte ein.",
     "label_birth_date": "Geburtsdatum",
+    "placeholder_birth_date": "TT.MM.JJJJ",
+    "btn_pick_date": "Datum im Kalender wählen",
     "label_birth_time": "Geburtszeit",
     "title_birth_time": "Geburtszeit (optional, Standard 12:00)",
     "label_birth_lunar_age": "Mondalter bei Geburt",

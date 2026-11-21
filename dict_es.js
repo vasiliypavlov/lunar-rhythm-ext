@@ -586,6 +586,8 @@ export const DICT_ES = {
     "settings_rhythm_title": "Ritmo Personal (Estado B)",
     "settings_rhythm_desc": "Sin fecha de nacimiento, la extensión funciona como un calendario lunar preciso. Indica tu fecha de nacimiento para calcular fases personales y aspectos.",
     "label_birth_date": "Fecha de nacimiento",
+    "placeholder_birth_date": "dd.mm.aaaa",
+    "btn_pick_date": "Elegir fecha en el calendario",
     "label_birth_time": "Hora de nacimiento",
     "title_birth_time": "Hora de nacimiento (opcional, por defecto 12:00)",
     "label_birth_lunar_age": "edad lunar natal",

@@ -1056,7 +1056,14 @@ function updateStaticUILabels(dict) {
   document.getElementById('tab-reminders').setAttribute('aria-label', labels.nav_reminders);
   document.getElementById('tab-settings').setAttribute('aria-label', labels.nav_settings);
   document.getElementById('select-builtin-lang').setAttribute('aria-label', labels.label_builtin_lang);
-  document.getElementById('input-birth-date').setAttribute('aria-label', labels.label_birth_date);
+  const birthInputEl = document.getElementById('input-birth-date');
+  birthInputEl.setAttribute('aria-label', labels.label_birth_date);
+  birthInputEl.placeholder = labels.placeholder_birth_date || 'dd.mm.yyyy';
+  const birthPickerBtn = document.getElementById('btn-birth-date-picker');
+  if (birthPickerBtn) {
+    birthPickerBtn.title = labels.btn_pick_date || labels.label_birth_date;
+    birthPickerBtn.setAttribute('aria-label', labels.btn_pick_date || labels.label_birth_date);
+  }
   const birthTimeEl = document.getElementById('input-birth-time');
   birthTimeEl.setAttribute('aria-label', labels.label_birth_time);
   birthTimeEl.title = labels.title_birth_time;
@@ -1980,10 +1987,54 @@ function renderRemindersList(dict) {
   });
 }
 
+function formatIsoToDisplayDate(isoStr) {
+  if (!isoStr || typeof isoStr !== 'string') return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoStr.trim());
+  if (!m) return '';
+  return `${m[3]}.${m[2]}.${m[1]}`;
+}
+
+function parseDisplayOrIsoDate(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const s = raw.trim();
+  let y, m, d;
+  const isoMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  const dmyMatch = /^(\d{2})[.\/:-](\d{2})[.\/:-](\d{4})$/.exec(s);
+  if (isoMatch) {
+    y = Number(isoMatch[1]);
+    m = Number(isoMatch[2]);
+    d = Number(isoMatch[3]);
+  } else if (dmyMatch) {
+    d = Number(dmyMatch[1]);
+    m = Number(dmyMatch[2]);
+    y = Number(dmyMatch[3]);
+  } else {
+    return null;
+  }
+  if (y < 1900 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(y, m - 1, d, 12, 0, 0, 0);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+function maskBirthDateDigits(raw) {
+  const digits = String(raw || '').replace(/\D/g, '').slice(0, 8);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}.${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}.${digits.slice(2, 4)}.${digits.slice(4, 8)}`;
+}
+
 function renderSettingsPanel(dict) {
   const labels = getUILabels(dict);
   const birthInput = document.getElementById('input-birth-date');
-  birthInput.value = appState.birthDate || '';
+  const birthPicker = document.getElementById('input-birth-date-picker');
+  const displayBirth = formatIsoToDisplayDate(appState.birthDate);
+  if (typeof document.activeElement === 'undefined' || document.activeElement !== birthInput || !displayBirth) {
+    birthInput.value = displayBirth;
+  }
+  if (birthPicker) {
+    birthPicker.value = appState.birthDate || '';
+  }
   document.getElementById('input-birth-time').value = appState.birthTime || '';
 
   const profileBox = document.getElementById('profile-summary-box');
@@ -2324,12 +2375,80 @@ function bindEvents() {
     renderUI();
   });
 
-  // Settings Tab: Birth date & optional birth time
-  document.getElementById('input-birth-date').addEventListener('change', async (e) => {
-    appState.birthDate = e.target.value || null;
-    await extBridge.saveState({ birthDate: appState.birthDate });
-    renderUI();
+  // Settings Tab: Birth date (language-aware mask + native picker sync) & optional birth time
+  const birthInputEl = document.getElementById('input-birth-date');
+  const birthPickerEl = document.getElementById('input-birth-date-picker');
+
+  birthInputEl.addEventListener('input', async (e) => {
+    const rawVal = e.target.value;
+    const directIso = /^\d{4}-\d{2}-\d{2}$/.test(rawVal.trim()) ? parseDisplayOrIsoDate(rawVal) : null;
+    if (directIso) {
+      e.target.value = formatIsoToDisplayDate(directIso);
+      if (appState.birthDate !== directIso) {
+        appState.birthDate = directIso;
+        await extBridge.saveState({ birthDate: directIso });
+        renderUI();
+      }
+      return;
+    }
+
+    const digits = rawVal.replace(/\D/g, '').slice(0, 8);
+    const formatted = maskBirthDateDigits(digits);
+    if (e.target.value !== formatted) {
+      e.target.value = formatted;
+    }
+
+    if (digits.length === 0) {
+      if (appState.birthDate !== null) {
+        appState.birthDate = null;
+        await extBridge.saveState({ birthDate: null });
+        renderUI();
+      }
+      return;
+    }
+
+    if (digits.length === 8) {
+      const parsedIso = parseDisplayOrIsoDate(formatted);
+      if (parsedIso && appState.birthDate !== parsedIso) {
+        appState.birthDate = parsedIso;
+        await extBridge.saveState({ birthDate: parsedIso });
+        renderUI();
+      }
+    }
   });
+
+  birthInputEl.addEventListener('blur', async (e) => {
+    const trimmed = e.target.value.trim();
+    if (!trimmed) {
+      if (appState.birthDate !== null) {
+        appState.birthDate = null;
+        await extBridge.saveState({ birthDate: null });
+        renderUI();
+      }
+      return;
+    }
+    const parsedIso = parseDisplayOrIsoDate(trimmed);
+    if (parsedIso) {
+      e.target.value = formatIsoToDisplayDate(parsedIso);
+      if (appState.birthDate !== parsedIso) {
+        appState.birthDate = parsedIso;
+        await extBridge.saveState({ birthDate: parsedIso });
+        renderUI();
+      }
+    } else {
+      e.target.value = formatIsoToDisplayDate(appState.birthDate);
+    }
+  });
+
+  if (birthPickerEl) {
+    birthPickerEl.addEventListener('change', async (e) => {
+      const iso = e.target.value || null;
+      appState.birthDate = iso;
+      birthInputEl.value = formatIsoToDisplayDate(iso);
+      await extBridge.saveState({ birthDate: appState.birthDate });
+      renderUI();
+    });
+  }
 
   document.getElementById('input-birth-time').addEventListener('change', async (e) => {
     appState.birthTime = e.target.value || null;
