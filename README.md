@@ -6,6 +6,8 @@
 
 [English](#english) | [Русский](#русский)
 
+> **📘 Руководство по астрономии и модели ритмов:** Подробный разбор физики лунных фаз, расчётов восхода/захода, лунных суток и практической работы с приложением — в [lunar_rhythm_navigator.md](lunar_rhythm_navigator.md).
+
 ---
 
 ## Screenshots / Скриншоты
@@ -96,8 +98,9 @@ lunar-rhythm-ext/
 ├── dict_es.js              # Spanish dictionary (v2.0)
 ├── dict_de.js              # German dictionary (v2.0)
 ├── dict_fr.js              # French dictionary (v2.0)
+├── lunar_rhythm_navigator.md # Astronomy & rhythm guide
 ├── icons/                  # Extension icons (16, 32, 48, 128 px)
-└── docs/                   # Documentation screenshots
+└── docs/                   # Documentation screenshots & SVG diagrams
 ```
 
 ## License / Лицензия
@@ -105,4 +108,3 @@ lunar-rhythm-ext/
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see the [LICENSE](LICENSE) file for details. Any derivative works or modified distributions must also be released under the same GPL-3.0 license.
 
 Проект распространяется под лицензией **GNU General Public License v3.0 (GPL-3.0)** — подробности в файле [LICENSE](LICENSE). Любые производные работы и модификации также должны распространяться с открытым исходным кодом под лицензией GPL-3.0.
-
