@@ -550,11 +550,69 @@ function resolveLanguageNameEn(bcp47Lang) {
   return baseCode === 'ru' ? 'Russian' : raw;
 }
 
+function formatMoonLocPhrase(baseLang, canonicalSign, signName, ingressInfo, withTimeAdverb = false, includeToday = true) {
+  const ruSignGen = getRuZodiacGenitive(canonicalSign, signName);
+  if (ingressInfo) {
+    const t = ingressInfo.timeStr;
+    const fromRu = getRuZodiacGenitive(ingressInfo.fromCanonical, ingressInfo.fromSignName);
+    const toRu = getRuZodiacGenitive(ingressInfo.toCanonical, ingressInfo.toSignName);
+    switch (baseLang) {
+      case 'ru': {
+        const prefix = withTimeAdverb ? (includeToday ? 'сегодня ' : 'в этот день ') : '';
+        return `${prefix}Луна до ${t} в знаке ${fromRu}, далее в знаке ${toRu}`;
+      }
+      case 'es': {
+        const prefix = withTimeAdverb && includeToday ? 'hoy ' : '';
+        return `${prefix}la Luna está en ${ingressInfo.fromSignName} hasta las ${t} y después en ${ingressInfo.toSignName}`;
+      }
+      case 'de': {
+        const prefix = withTimeAdverb && includeToday ? 'heute steht ' : '';
+        const verb = withTimeAdverb && includeToday ? '' : ' steht';
+        return `${prefix}der Mond${verb} bis ${t} im Zeichen ${ingressInfo.fromSignName}, danach im Zeichen ${ingressInfo.toSignName}`;
+      }
+      case 'fr': {
+        const prefix = withTimeAdverb && includeToday ? "aujourd'hui " : '';
+        return `${prefix}la Lune est en ${ingressInfo.fromSignName} jusqu'à ${t}, puis en ${ingressInfo.toSignName}`;
+      }
+      default: {
+        const prefix = withTimeAdverb && includeToday ? 'today ' : '';
+        return `${prefix}the Moon is in ${ingressInfo.fromSignName} until ${t}, then in ${ingressInfo.toSignName}`;
+      }
+    }
+  }
+
+  switch (baseLang) {
+    case 'ru': {
+      const prefix = withTimeAdverb ? (includeToday ? 'сегодня ' : 'в этот день ') : '';
+      return `${prefix}Луна в знаке ${ruSignGen}`;
+    }
+    case 'es': {
+      const prefix = withTimeAdverb && includeToday ? 'hoy ' : '';
+      return `${prefix}la Luna está en ${signName}`;
+    }
+    case 'de': {
+      const prefix = withTimeAdverb && includeToday ? 'heute steht ' : '';
+      const verb = withTimeAdverb && includeToday ? '' : ' steht';
+      return `${prefix}der Mond${verb} im Zeichen ${signName}`;
+    }
+    case 'fr': {
+      const prefix = withTimeAdverb && includeToday ? "aujourd'hui " : '';
+      return `${prefix}la Lune est en ${signName}`;
+    }
+    default: {
+      const prefix = withTimeAdverb && includeToday ? 'today ' : '';
+      return `${prefix}the Moon is in ${signName}`;
+    }
+  }
+}
+
 function formatSpeechByLang(baseLang, parts) {
   const {
     lunarDaySpeech,
     trendLabel,
+    canonicalSign,
     signName,
+    ingressInfo,
     lunarDayNote,
     zodiacHint,
     illuminationPct,
@@ -570,11 +628,35 @@ function formatSpeechByLang(baseLang, parts) {
     tip
   } = parts;
 
+  const speechSignLead = (langCode) => {
+    if (!ingressInfo) {
+      switch (langCode) {
+        case 'ru': return `в знаке ${signName}`;
+        case 'es': return `en ${signName}`;
+        case 'de': return `im Zeichen ${signName}`;
+        case 'fr': return `en ${signName}`;
+        default: return `in ${signName}`;
+      }
+    }
+    const t = ingressInfo.timeStr;
+    const fromRu = getRuZodiacGenitive(ingressInfo.fromCanonical, ingressInfo.fromSignName);
+    const toRu = getRuZodiacGenitive(ingressInfo.toCanonical, ingressInfo.toSignName);
+    switch (langCode) {
+      case 'ru': return `Луна до ${t} в знаке ${fromRu}, далее в знаке ${toRu}`;
+      case 'es': return `con la Luna en ${ingressInfo.fromSignName} hasta las ${t} y luego en ${ingressInfo.toSignName}`;
+      case 'de': return `der Mond steht bis ${t} im Zeichen ${ingressInfo.fromSignName}, danach im Zeichen ${ingressInfo.toSignName}`;
+      case 'fr': return `la Lune est en ${ingressInfo.fromSignName} jusqu'à ${t}, puis en ${ingressInfo.toSignName}`;
+      default: return `the Moon is in ${ingressInfo.fromSignName} until ${t}, then in ${ingressInfo.toSignName}`;
+    }
+  };
+
   if (!phaseTitle) {
+    const signPhrase = speechSignLead(baseLang);
+    const sep = ingressInfo ? ': ' : ' ';
     switch (baseLang) {
       case 'ru':
         return [
-          `На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} в знаке ${signName}.`,
+          `На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${sep}${signPhrase}.`,
           dayThemeFocus,
           lunarDayNote,
           `Обстановка дня располагает к тому, что ${zodiacHint}, а освещённость Луны составляет ${illuminationPct} процентов.`,
@@ -582,7 +664,7 @@ function formatSpeechByLang(baseLang, parts) {
         ];
       case 'es':
         return [
-          `Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`,
+          `Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${ingressInfo ? ', ' : ' '}${signPhrase}.`,
           dayThemeFocus,
           lunarDayNote,
           `La jornada favorece ${zodiacHint}, con una iluminación lunar del ${illuminationPct} por ciento.`,
@@ -590,7 +672,7 @@ function formatSpeechByLang(baseLang, parts) {
         ];
       case 'de':
         return [
-          `Heute ist der ${lunarDaySpeech}, ${trendLabel} im Zeichen ${signName}.`,
+          `Heute ist der ${lunarDaySpeech}, ${trendLabel}${ingressInfo ? '; ' : ' '}${signPhrase}.`,
           dayThemeFocus,
           lunarDayNote,
           `Die Tagesstimmung unterstützt ${zodiacHint}, bei ${illuminationPct} Prozent Mondbeleuchtung.`,
@@ -598,7 +680,7 @@ function formatSpeechByLang(baseLang, parts) {
         ];
       case 'fr':
         return [
-          `Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`,
+          `Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${ingressInfo ? ' ; ' : ' '}${signPhrase}.`,
           dayThemeFocus,
           lunarDayNote,
           `L'ambiance du jour favorise ${zodiacHint}, avec une illumination lunaire de ${illuminationPct} pour cent.`,
@@ -606,7 +688,7 @@ function formatSpeechByLang(baseLang, parts) {
         ];
       default:
         return [
-          `Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} in ${signName}.`,
+          `Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${ingressInfo ? '; ' : ' '}${signPhrase}.`,
           dayThemeFocus,
           lunarDayNote,
           `The day favors ${zodiacHint}, with lunar illumination at ${illuminationPct} percent.`,
@@ -616,9 +698,11 @@ function formatSpeechByLang(baseLang, parts) {
   }
 
   const sentences = [];
+  const signPhrase = speechSignLead(baseLang);
+  const sep = ingressInfo ? (baseLang === 'ru' ? ': ' : baseLang === 'es' ? ', ' : '; ') : ' ';
   switch (baseLang) {
     case 'ru':
-      sentences.push(`На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} в знаке ${signName}.`);
+      sentences.push(`На календаре ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${sep}${signPhrase}.`);
       sentences.push(phaseVariantLine || `Идёт ${dayInPhase}-й день этапа «${phaseTitle}».`);
       if (roleTone) sentences.push(roleTone);
       if (dayThemeFocus) sentences.push(dayThemeFocus);
@@ -631,7 +715,7 @@ function formatSpeechByLang(baseLang, parts) {
         };
         sentences.push(`В сфере «${uncapitalizeFirst(edgeInfo.actorTitle)}» ${uncapitalizeFirst(edgeInfo.advice)}, причём ${dynMap[edgeInfo.dynamicKey]}.`);
       } else if (!bridgeText) {
-        sentences.push(`Влияние знака ${signName} делает этот день удобным там, где важно ${zodiacHint}.`);
+        sentences.push(`Влияние знака ${getRuZodiacGenitive(canonicalSign, signName)} делает этот день удобным там, где важно ${zodiacHint}.`);
       }
       if (bgAdvice) {
         sentences.push(`${stripTrailingDot(lunarDayNote)}, а на длинной дистанции сегодня ощущается точный пик: ${uncapitalizeFirst(bgAdvice)}.`);
@@ -642,7 +726,7 @@ function formatSpeechByLang(baseLang, parts) {
       return sentences;
 
     case 'es':
-      sentences.push(`Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`);
+      sentences.push(`Hoy es ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${sep}${signPhrase}.`);
       sentences.push(phaseVariantLine || `Es el día ${dayInPhase} de la fase «${phaseTitle}».`);
       if (roleTone) sentences.push(roleTone);
       if (dayThemeFocus) sentences.push(dayThemeFocus);
@@ -666,7 +750,7 @@ function formatSpeechByLang(baseLang, parts) {
       return sentences;
 
     case 'de':
-      sentences.push(`Heute ist der ${lunarDaySpeech}, ${trendLabel} im Zeichen ${signName}.`);
+      sentences.push(`Heute ist der ${lunarDaySpeech}, ${trendLabel}${sep}${signPhrase}.`);
       sentences.push(phaseVariantLine || `Es ist Tag ${dayInPhase} der Phase «${phaseTitle}».`);
       if (roleTone) sentences.push(roleTone);
       if (dayThemeFocus) sentences.push(dayThemeFocus);
@@ -690,7 +774,7 @@ function formatSpeechByLang(baseLang, parts) {
       return sentences;
 
     case 'fr':
-      sentences.push(`Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} en ${signName}.`);
+      sentences.push(`Aujourd'hui, c'est le ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${sep}${signPhrase}.`);
       sentences.push(phaseVariantLine || `Nous sommes au jour ${dayInPhase} de la phase « ${phaseTitle} ».`);
       if (roleTone) sentences.push(roleTone);
       if (dayThemeFocus) sentences.push(dayThemeFocus);
@@ -714,7 +798,7 @@ function formatSpeechByLang(baseLang, parts) {
       return sentences;
 
     default:
-      sentences.push(`Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)} in ${signName}.`);
+      sentences.push(`Today is the ${lunarDaySpeech}, ${uncapitalizeFirst(trendLabel)}${sep}${signPhrase}.`);
       sentences.push(phaseVariantLine || `You are on day ${dayInPhase} of the "${phaseTitle}" phase.`);
       if (roleTone) sentences.push(roleTone);
       if (dayThemeFocus) sentences.push(dayThemeFocus);
@@ -764,12 +848,23 @@ function buildBriefingSpeechText() {
   const dateSeed = toISODate(selectedDate);
   const dayTheme = getDayTheme(dict, sign);
   const dayThemeFocus = dayTheme?.focus || '';
+  const ingressInfo = summary.signIngress
+    ? {
+        fromCanonical: summary.signIngress.fromSign,
+        toCanonical: summary.signIngress.toSign,
+        fromSignName: getLocalizedZodiacSign(dict, summary.signIngress.fromSign),
+        toSignName: getLocalizedZodiacSign(dict, summary.signIngress.toSign),
+        timeStr: summary.signIngress.timeStr
+      }
+    : null;
 
   if (!appState.birthDate) {
     const sentences = formatSpeechByLang(baseLang, {
       lunarDaySpeech,
       trendLabel,
+      canonicalSign: sign,
       signName,
+      ingressInfo,
       lunarDayNote,
       zodiacHint,
       dayThemeFocus,
@@ -814,7 +909,9 @@ function buildBriefingSpeechText() {
   const sentences = formatSpeechByLang(baseLang, {
     lunarDaySpeech,
     trendLabel,
+    canonicalSign: sign,
     signName,
+    ingressInfo,
     lunarDayNote,
     zodiacHint,
     phaseTitle: phase.title,
@@ -905,9 +1002,13 @@ function buildExternalAIPrompt() {
   }
 
   const dayThemeObj = getDayTheme(dict, sign);
+  const ingressLine = summary.signIngress
+    ? `- Exact Moon Sign Ingress Today: ${summary.signIngress.fromSign} -> ${summary.signIngress.toSign} at ${summary.signIngress.timeStr}`
+    : null;
   lines.push(
     `- Moon Phase & Illumination: ${detailedTrend}, Moon age ${summary.phaseInfo.moonAge.toFixed(1)} days, ${summary.phaseInfo.illuminationExact.toFixed(1)}% illuminated`,
     `- Moon Zodiac Sign: ${sign} (${zodiacHint})${dayThemeObj ? `; Daily Theme: ${dayThemeObj.title} — ${dayThemeObj.focus}` : ''}`,
+    ...(ingressLine ? [ingressLine] : []),
     `- Intra-day Moon Sign Windows: Morning 09:00 = ${summary.windows.morning.zodiacSign}, Day 14:00 = ${summary.windows.day.zodiacSign}, Evening 20:00 = ${summary.windows.evening.zodiacSign}`
   );
 
@@ -1175,19 +1276,19 @@ function buildTodayIntroText(baseLang, ctx) {
     lunarDayFullLabel,
     canonicalSign,
     signName,
+    ingressInfo,
     zodiacHint,
     detailedTrendLabel,
     illuminationStr
   } = ctx;
 
-  const signRuGen = getRuZodiacGenitive(canonicalSign, signName);
   const themeNote = dayThemeFocus ? ` ${dayThemeFocus}` : '';
+  const moonLoc = formatMoonLocPhrase(baseLang, canonicalSign, signName, ingressInfo, true, isToday);
 
   if (!isPersonal) {
     switch (baseLang) {
       case 'ru': {
         const dayStr = `${getRuOrdinalNumeric(activeLunarDay)} ${lunarDayFullLabel}`;
-        const moonLoc = isToday ? `сегодня Луна в знаке ${signRuGen}` : `в этот день Луна в знаке ${signRuGen}`;
         const lead = `Идут ${dayStr}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).${themeNote}`;
         if (statusKey === 'refrain') {
           return `${lead} Лучше воздержаться от новых стартов, крупных обязательств и поспешных решений — время подходит для спокойного завершения дел и восстановления.`;
@@ -1198,7 +1299,6 @@ function buildTodayIntroText(baseLang, ctx) {
         return `${lead} Благоприятно для задач, где помогают ${zodiacHint}.`;
       }
       case 'es': {
-        const moonLoc = isToday ? `hoy la Luna está en ${signName}` : `la Luna está en ${signName}`;
         const lead = `Transcurre el ${activeLunarDay}.º ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).${themeNote}`;
         if (statusKey === 'refrain') {
           return `${lead} Mejor abstenerse de nuevos comienzos, grandes compromisos y decisiones apresuradas — momento propicio para cerrar pendientes y descansar.`;
@@ -1209,7 +1309,6 @@ function buildTodayIntroText(baseLang, ctx) {
         return `${lead} Favorable para tareas donde ayuda ${zodiacHint}.`;
       }
       case 'de': {
-        const moonLoc = isToday ? `heute steht der Mond im Zeichen ${signName}` : `der Mond steht im Zeichen ${signName}`;
         const lead = `Es läuft der ${activeLunarDay}. ${lunarDayFullLabel}, ${moonLoc} (${detailedTrendLabel}, ${illuminationStr}%).${themeNote}`;
         if (statusKey === 'refrain') {
           return `${lead} Besser zurückhalten bei Neustarts, großen Verpflichtungen und vorschnellen Entscheidungen — ruhige Zeit für Abschlüsse und Erholung.`;
@@ -1220,7 +1319,6 @@ function buildTodayIntroText(baseLang, ctx) {
         return `${lead} Günstig für Vorhaben mit Fokus auf ${zodiacHint}.`;
       }
       case 'fr': {
-        const moonLoc = isToday ? `aujourd'hui la Lune est en ${signName}` : `la Lune est en ${signName}`;
         const lead = `Nous sommes au ${activeLunarDay}e ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).${themeNote}`;
         if (statusKey === 'refrain') {
           return `${lead} Mieux vaut s'abstenir de nouveaux départs, de gros engagements et de décisions hâtives — temps calme propice au bouclage et au repos.`;
@@ -1231,7 +1329,6 @@ function buildTodayIntroText(baseLang, ctx) {
         return `${lead} Favorable aux démarches soutenues par ${zodiacHint}.`;
       }
       default: {
-        const moonLoc = isToday ? `today the Moon is in ${signName}` : `the Moon is in ${signName}`;
         const lead = `It is the ${toEnglishOrdinal(activeLunarDay)} ${lunarDayFullLabel}, ${moonLoc} (${uncapitalizeFirst(detailedTrendLabel)}, ${illuminationStr}%).${themeNote}`;
         if (statusKey === 'refrain') {
           return `${lead} Best to refrain from new launches, major commitments, and hasty decisions — a quiet window for wrapping up open items and recovery.`;
@@ -1249,7 +1346,6 @@ function buildTodayIntroText(baseLang, ctx) {
       const roleBit = roleTitle ? `, формат дня — ${uncapitalizeFirst(roleTitle)}` : '';
       const courseSentence = `Основной курс дня — ${uncapitalizeFirst(phaseTitle)} (день ${dayInPhase} из ${totalDays}${roleBit}): опирайтесь на ${uncapitalizeFirst(profileTitle)} и ${getRuAccusativePhrase(ageTitle)}.`;
       const dayStr = `${getRuOrdinalNumeric(activeLunarDay)} ${lunarDayFullLabel}`;
-      const moonLoc = isToday ? `сегодня Луна в знаке ${signRuGen}` : `в этот день Луна в знаке ${signRuGen}`;
       let guidanceSentence = '';
       let lunarFocus = '';
 
@@ -1278,7 +1374,6 @@ function buildTodayIntroText(baseLang, ctx) {
     case 'es': {
       const roleBit = roleTitle ? `, formato de hoy: ${roleTitle.toLowerCase()}` : '';
       const courseSentence = `El rumbo principal de hoy es ${phaseTitle.toLowerCase()} (día ${dayInPhase} de ${totalDays}${roleBit}): apóyate en ${profileTitle.toLowerCase()} y ${ageTitle.toLowerCase()}.`;
-      const moonLoc = isToday ? `hoy la Luna está en ${signName}` : `la Luna está en ${signName}`;
       let guidanceSentence = '';
       let lunarFocus = '';
 
@@ -1307,7 +1402,6 @@ function buildTodayIntroText(baseLang, ctx) {
     case 'de': {
       const roleBit = roleTitle ? `, Tagesmodus: ${roleTitle}` : '';
       const courseSentence = `Der heutige Hauptkurs ist ${phaseTitle} (Tag ${dayInPhase} von ${totalDays}${roleBit}): stützen Sie sich auf ${profileTitle} und ${ageTitle}.`;
-      const moonLoc = isToday ? `heute steht der Mond im Zeichen ${signName}` : `der Mond steht im Zeichen ${signName}`;
       let guidanceSentence = '';
       let lunarFocus = '';
 
@@ -1336,7 +1430,6 @@ function buildTodayIntroText(baseLang, ctx) {
     case 'fr': {
       const roleBit = roleTitle ? `, format du jour : ${roleTitle.toLowerCase()}` : '';
       const courseSentence = `Le cap principal du jour est ${phaseTitle.toLowerCase()} (jour ${dayInPhase} sur ${totalDays}${roleBit}) : appuyez-vous sur ${profileTitle.toLowerCase()} et ${ageTitle.toLowerCase()}.`;
-      const moonLoc = isToday ? `aujourd'hui la Lune est en ${signName}` : `la Lune est en ${signName}`;
       let guidanceSentence = '';
       let lunarFocus = '';
 
@@ -1365,7 +1458,6 @@ function buildTodayIntroText(baseLang, ctx) {
     default: {
       const roleBit = roleTitle ? `, daily mode: ${roleTitle.toLowerCase()}` : '';
       const courseSentence = `Today's core course is ${phaseTitle.toLowerCase()} (day ${dayInPhase} of ${totalDays}${roleBit}): lean on ${profileTitle.toLowerCase()} and ${ageTitle.toLowerCase()}.`;
-      const moonLoc = isToday ? `today the Moon is in ${signName}` : `the Moon is in ${signName}`;
       let guidanceSentence = '';
       let lunarFocus = '';
 
@@ -1394,8 +1486,39 @@ function buildTodayIntroText(baseLang, ctx) {
   }
 }
 
-function formatSignShiftNote(baseLang, canonicalSign, signName, slot) {
+function formatUntilTimeSuffix(baseLang, timeStr) {
+  if (!timeStr) return '';
+  switch (baseLang) {
+    case 'ru': return ` (до ${timeStr})`;
+    case 'es': return ` (hasta las ${timeStr})`;
+    case 'de': return ` (bis ${timeStr})`;
+    case 'fr': return ` (jusqu'à ${timeStr})`;
+    default: return ` (until ${timeStr})`;
+  }
+}
+
+function formatDayIngressFocus(baseLang, canonicalSign, signName, hintText, timeStr) {
   const ruSign = getRuZodiacGenitive(canonicalSign, signName);
+  switch (baseLang) {
+    case 'ru': return `С ${timeStr} Луна переходит в знак ${ruSign}: ${hintText}.`;
+    case 'es': return `Desde las ${timeStr}, la Luna pasa a ${signName}: ${hintText}.`;
+    case 'de': return `Ab ${timeStr} wechselt der Mond ins Zeichen ${signName}: ${hintText}.`;
+    case 'fr': return `À partir de ${timeStr}, la Lune passe en ${signName} : ${hintText}.`;
+    default: return `From ${timeStr}, the Moon enters ${signName}: ${hintText}.`;
+  }
+}
+
+function formatSignShiftNote(baseLang, canonicalSign, signName, slot, ingressTimeStr = '') {
+  const ruSign = getRuZodiacGenitive(canonicalSign, signName);
+  if (ingressTimeStr) {
+    switch (baseLang) {
+      case 'ru': return `С ${ingressTimeStr} Луна переходит в знак ${ruSign}.`;
+      case 'es': return `Desde las ${ingressTimeStr}, la Luna pasa a ${signName}.`;
+      case 'de': return `Ab ${ingressTimeStr} wechselt der Mond ins Zeichen ${signName}.`;
+      case 'fr': return `À partir de ${ingressTimeStr}, la Lune passe en ${signName}.`;
+      default: return `From ${ingressTimeStr}, the Moon enters ${signName}.`;
+    }
+  }
   switch (baseLang) {
     case 'ru':
       return slot === 'evening'
@@ -1439,6 +1562,8 @@ function buildSlotCardsData(baseLang, ctx) {
     canonicalSign,
     signName,
     zodiacHint,
+    dayZodiacHint,
+    ingressInfo,
     morningCanonicalSign,
     dayCanonicalSign,
     eveningCanonicalSign,
@@ -1458,8 +1583,8 @@ function buildSlotCardsData(baseLang, ctx) {
     tips
   } = ctx;
 
-  const signRuGen = getRuZodiacGenitive(canonicalSign, signName);
   const bridgePrefix = bridgeText ? `${bridgeText} ` : '';
+  const ingressTime = ingressInfo?.timeStr || '';
 
   // 1. Morning text (uses L0 phaseVariant/phaseDayNote + harmonized L1 roleTone + L2 morning focus cue + morning lifestyle tip)
   let morningText = '';
@@ -1469,18 +1594,20 @@ function buildSlotCardsData(baseLang, ctx) {
   } else {
     const mSign = morningSignName || signName;
     const mCanonical = morningCanonicalSign || canonicalSign;
+    const untilSuffix = signShiftedDay && ingressTime ? formatUntilTimeSuffix(baseLang, ingressTime) : '';
     const guestMorningByLang = {
-      ru: `Утренний ориентир задаёт ${uncapitalizeFirst(detailedTrendLabel)} в знаке ${getRuZodiacGenitive(mCanonical, mSign)}.`,
-      es: `La mañana queda marcada por ${uncapitalizeFirst(detailedTrendLabel)} en ${mSign}.`,
-      de: `Den Morgen prägt die Phase ${detailedTrendLabel} im Zeichen ${mSign}.`,
-      fr: `La matinée est guidée par ${uncapitalizeFirst(detailedTrendLabel)} en ${mSign}.`,
-      en: `The morning tone is set by ${uncapitalizeFirst(detailedTrendLabel)} in ${mSign}.`
+      ru: `Утренний ориентир задаёт ${uncapitalizeFirst(detailedTrendLabel)} в знаке ${getRuZodiacGenitive(mCanonical, mSign)}${untilSuffix}.`,
+      es: `La mañana queda marcada por ${uncapitalizeFirst(detailedTrendLabel)} en ${mSign}${untilSuffix}.`,
+      de: `Den Morgen prägt die Phase ${detailedTrendLabel} im Zeichen ${mSign}${untilSuffix}.`,
+      fr: `La matinée est guidée par ${uncapitalizeFirst(detailedTrendLabel)} en ${mSign}${untilSuffix}.`,
+      en: `The morning tone is set by ${uncapitalizeFirst(detailedTrendLabel)} in ${mSign}${untilSuffix}.`
     };
     morningText = [guestMorningByLang[baseLang] || guestMorningByLang.en, morningCue, tips.morning].filter(Boolean).join(' ');
   }
 
   // 2. Day text (primary fast/baseline edge + intraday day shift note + L2 day focus cue + background + day tip)
   let dayTactics = '';
+  let dayShiftNote = '';
   if (isPersonal && edgeDetail) {
     const aspectLine = `${edgeDetail.actorTitle} — ${uncapitalizeFirst(edgeDetail.maneuverTitle)}. ${edgeDetail.scenarioAdvice} ${edgeDetail.dynamicText}`.trim();
     let bgLine = '';
@@ -1489,19 +1616,30 @@ function buildSlotCardsData(baseLang, ctx) {
       bgLine = `${bgDetail.isExact ? `${labels.card_weekly_bg} (${labels.card_exact_peak_badge})` : labels.card_weekly_bg}: ${bgSentence}`;
     }
     dayTactics = `${bridgePrefix}${aspectLine}${bgLine ? ` ${bgLine}` : ''}`.trim();
+    dayShiftNote = signShiftedDay
+      ? formatSignShiftNote(baseLang, dayCanonicalSign || canonicalSign, daySignName, 'day', ingressTime)
+      : '';
   } else {
-    const signFocusByLang = {
-      ru: `Фокус знака ${signRuGen}: ${zodiacHint}.`,
-      es: `Enfoque lunar en ${signName}: ${zodiacHint}.`,
-      de: `Fokus im Zeichen ${signName}: ${zodiacHint}.`,
-      fr: `Focus de la Lune en ${signName} : ${zodiacHint}.`,
-      en: `Moon focus in ${signName}: ${zodiacHint}.`
-    };
-    dayTactics = `${bridgePrefix}${signFocusByLang[baseLang] || signFocusByLang.en}`.trim();
+    const dCanonical = dayCanonicalSign || canonicalSign;
+    const dSignName = daySignName || signName;
+    const dHint = dayZodiacHint || zodiacHint;
+    if (signShiftedDay && ingressTime) {
+      dayTactics = `${bridgePrefix}${formatDayIngressFocus(baseLang, dCanonical, dSignName, dHint, ingressTime)}`.trim();
+    } else {
+      const dRuGen = getRuZodiacGenitive(dCanonical, dSignName);
+      const signFocusByLang = {
+        ru: `Фокус знака ${dRuGen}: ${dHint}.`,
+        es: `Enfoque lunar en ${dSignName}: ${dHint}.`,
+        de: `Fokus im Zeichen ${dSignName}: ${dHint}.`,
+        fr: `Focus de la Lune en ${dSignName} : ${dHint}.`,
+        en: `Moon focus in ${dSignName}: ${dHint}.`
+      };
+      dayTactics = `${bridgePrefix}${signFocusByLang[baseLang] || signFocusByLang.en}`.trim();
+      dayShiftNote = signShiftedDay
+        ? formatSignShiftNote(baseLang, dCanonical, dSignName, 'day', ingressTime)
+        : '';
+    }
   }
-  const dayShiftNote = signShiftedDay
-    ? formatSignShiftNote(baseLang, dayCanonicalSign || canonicalSign, daySignName, 'day')
-    : '';
   const dayCue = ensureSentence(windowCues?.day);
   const dayText = [dayTactics, dayShiftNote, dayCue, tips.day].filter(Boolean).join(' ');
 
@@ -1523,7 +1661,7 @@ function buildSlotCardsData(baseLang, ctx) {
   const wrapLine = lunarDayNote ? (lunarWrapByLang[baseLang] || lunarWrapByLang.en) : '';
   const transLine = firstDay !== secondDay ? (transitionNoteByLang[baseLang] || transitionNoteByLang.en) : '';
   const eveningShiftNote = signShiftedEvening
-    ? formatSignShiftNote(baseLang, eveningCanonicalSign || canonicalSign, eveningSignName, 'evening')
+    ? formatSignShiftNote(baseLang, eveningCanonicalSign || canonicalSign, eveningSignName, 'evening', ingressTime)
     : '';
   const eveningCue = ensureSentence(windowCues?.evening);
   const eveningText = [wrapLine, eveningShiftNote, transLine, eveningCue, tips.evening].filter(Boolean).join(' ');
@@ -1696,6 +1834,16 @@ function renderHeroAndToday(dict) {
     dict.maneuvers?.[personal.dailyFocusEdge.aspectKey]?.valence === 'warning'
   );
 
+  const ingressInfo = summary.signIngress
+    ? {
+        fromCanonical: summary.signIngress.fromSign,
+        toCanonical: summary.signIngress.toSign,
+        fromSignName: getLocalizedZodiacSign(dict, summary.signIngress.fromSign),
+        toSignName: getLocalizedZodiacSign(dict, summary.signIngress.toSign),
+        timeStr: summary.signIngress.timeStr
+      }
+    : null;
+
   const introParagraph = buildTodayIntroText(baseLang, {
     isToday,
     isPersonal: Boolean(personal),
@@ -1713,6 +1861,7 @@ function renderHeroAndToday(dict) {
     lunarDayFullLabel: labels.lunar_day_full,
     canonicalSign: sign,
     signName,
+    ingressInfo,
     zodiacHint,
     detailedTrendLabel,
     illuminationStr: summary.phaseInfo.illuminationExact.toFixed(1)
@@ -1739,6 +1888,7 @@ function renderHeroAndToday(dict) {
   const morningSignName = getLocalizedZodiacSign(dict, wMorningSign);
   const daySignName = getLocalizedZodiacSign(dict, wDaySign);
   const eveningSignName = getLocalizedZodiacSign(dict, wEveningSign);
+  const dayZodiacHint = dict.zodiac_hints?.[wDaySign] || zodiacHint;
 
   const slotCards = buildSlotCardsData(baseLang, {
     labels,
@@ -1752,6 +1902,8 @@ function renderHeroAndToday(dict) {
     canonicalSign: sign,
     signName,
     zodiacHint,
+    dayZodiacHint,
+    ingressInfo,
     morningCanonicalSign: wMorningSign,
     dayCanonicalSign: wDaySign,
     eveningCanonicalSign: wEveningSign,
