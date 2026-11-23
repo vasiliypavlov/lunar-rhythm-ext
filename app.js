@@ -14,6 +14,7 @@ import {
   getLunarDayAt,
   getLunationIntervals,
   getMoonPhaseInfo,
+  getObserverCoords,
   getPlanetLongitudes,
   getTimeSlot,
   getZodiacSign,
@@ -22,6 +23,8 @@ import {
   computeRawDiagnosticData,
   findNextDateForLunarDay,
   parseBirthDateString,
+  parseObserverCoord,
+  setObserverCoords,
   signedAngleDiff,
   toJulianDay
 } from './astro_engine.js';
@@ -40,6 +43,8 @@ const ACTIVE_ALARM_BADGE_COLOR = '#E65100';
 const DEFAULT_PERSISTED_STATE = {
   birthDate: null,
   birthTime: null,
+  observerLat: null,
+  observerLon: null,
   builtinLang: null,
   dictionaryMode: 'default',
   customDictionary: null,
@@ -118,9 +123,21 @@ function mergePersistedDefaults(data) {
     ? data.builtinLang
     : detectDefaultLang();
 
+  const rawLat = parseObserverCoord(data && data.observerLat);
+  const rawLon = parseObserverCoord(data && data.observerLon);
+  const hasValidCoords =
+    rawLat !== null &&
+    rawLon !== null &&
+    rawLat >= -90 &&
+    rawLat <= 90 &&
+    rawLon >= -180 &&
+    rawLon <= 180;
+
   return {
     ...DEFAULT_PERSISTED_STATE,
     ...(data || {}),
+    observerLat: hasValidCoords ? Number(rawLat.toFixed(4)) : null,
+    observerLon: hasValidCoords ? Number(rawLon.toFixed(4)) : null,
     builtinLang,
     notifications: {
       ...DEFAULT_PERSISTED_STATE.notifications,
@@ -1523,6 +1540,12 @@ function buildAstronomyDataBlock(raw, summary, dict, ctx) {
   lines.push(
     `- First moonrise / first moonset inside the calendar day: ${summary.moonriseStr} / ${summary.moonsetStr}`
   );
+  if (raw.observer) {
+    const tzTag = raw.observer.timeZone ? `, ${raw.observer.timeZone}` : '';
+    lines.push(
+      `- Observer coordinates for horizon calculations: ${Number(raw.observer.latitude).toFixed(2)}°, ${Number(raw.observer.longitude).toFixed(2)}° (${raw.observer.source}${tzTag})`
+    );
+  }
   lines.push('');
 
   lines.push('THE DAY IN FOUR WINDOWS (the Moon moves through the day; each window belongs to a lunar day)');
@@ -2043,6 +2066,16 @@ function updateStaticUILabels(dict) {
   const birthTimeEl = document.getElementById('input-birth-time');
   birthTimeEl.setAttribute('aria-label', labels.label_birth_time);
   birthTimeEl.title = labels.title_birth_time;
+  const latInputEl = document.getElementById('input-observer-lat');
+  if (latInputEl) {
+    latInputEl.setAttribute('aria-label', labels.label_observer_lat || 'Latitude');
+    latInputEl.placeholder = labels.placeholder_observer_lat || 'Lat (e.g. 56.13)';
+  }
+  const lonInputEl = document.getElementById('input-observer-lon');
+  if (lonInputEl) {
+    lonInputEl.setAttribute('aria-label', labels.label_observer_lon || 'Longitude');
+    lonInputEl.placeholder = labels.placeholder_observer_lon || 'Lon (e.g. 47.25)';
+  }
   const copyRawBtn = document.getElementById('btn-copy-raw-data');
   if (!copyRawBtn.classList.contains('is-copied')) {
     copyRawBtn.textContent = labels.btn_copy_raw_data;
@@ -3113,6 +3146,51 @@ function maskBirthDateDigits(raw) {
   return `${digits.slice(0, 2)}.${digits.slice(2, 4)}.${digits.slice(4, 8)}`;
 }
 
+function updateObserverCoordsStatus(dict = getActiveDictionary(), isIncomplete = false) {
+  const box = document.getElementById('location-status-box');
+  if (!box) return;
+  const labels = getUILabels(dict);
+  if (isIncomplete) {
+    box.classList.add('is-warning');
+    box.textContent = labels.location_status_incomplete || 'Enter both latitude (-90..90) and longitude (-180..180).';
+    return;
+  }
+  box.classList.remove('is-warning');
+  const obs = getObserverCoords();
+  const coordsStr = `(${obs.latDeg.toFixed(2)}°, ${obs.lonDeg.toFixed(2)}°)`;
+  if (obs.source === 'manual') {
+    box.textContent = `${labels.location_status_manual || 'Active: Manual'} ${coordsStr}`;
+  } else {
+    const tzLabel = obs.timeZone ? ` · ${obs.timeZone}` : '';
+    box.textContent = `${labels.location_status_auto || 'Active: Auto'}${tzLabel} ${coordsStr}`;
+  }
+}
+
+function updateObserverCoordsUI(dict = getActiveDictionary()) {
+  const latInput = document.getElementById('input-observer-lat');
+  const lonInput = document.getElementById('input-observer-lon');
+  const activeEl = typeof document.activeElement !== 'undefined' ? document.activeElement : null;
+  if (latInput && activeEl !== latInput) {
+    latInput.value = appState.observerLat !== null ? String(appState.observerLat) : '';
+  }
+  if (lonInput && activeEl !== lonInput) {
+    lonInput.value = appState.observerLon !== null ? String(appState.observerLon) : '';
+  }
+  const latRaw = latInput ? latInput.value.trim() : '';
+  const lonRaw = lonInput ? lonInput.value.trim() : '';
+  const hasAnyTyped = Boolean(latRaw || lonRaw);
+  const latNum = parseObserverCoord(latRaw);
+  const lonNum = parseObserverCoord(lonRaw);
+  const typedValidPair =
+    latNum !== null &&
+    lonNum !== null &&
+    latNum >= -90 &&
+    latNum <= 90 &&
+    lonNum >= -180 &&
+    lonNum <= 180;
+  updateObserverCoordsStatus(dict, hasAnyTyped && !typedValidPair);
+}
+
 function renderSettingsPanel(dict) {
   const labels = getUILabels(dict);
   const birthInput = document.getElementById('input-birth-date');
@@ -3140,6 +3218,8 @@ function renderSettingsPanel(dict) {
     profileBox.classList.add('hidden');
     profileBox.innerHTML = '';
   }
+
+  updateObserverCoordsUI(dict);
 
   document.getElementById('input-morning-enabled').checked = Boolean(
     appState.notifications.morningEnabled
@@ -3552,6 +3632,85 @@ function bindEvents() {
     renderUI();
   });
 
+  // Settings Tab: Manual Observer Latitude & Longitude override (auto IANA when empty)
+  const latInputEl = document.getElementById('input-observer-lat');
+  const lonInputEl = document.getElementById('input-observer-lon');
+  const handleObserverCoordsEdit = async (commitCleanup = false) => {
+    const latRaw = latInputEl.value.trim();
+    const lonRaw = lonInputEl.value.trim();
+
+    if (!latRaw && !lonRaw) {
+      if (appState.observerLat !== null || appState.observerLon !== null) {
+        appState.observerLat = null;
+        appState.observerLon = null;
+        setObserverCoords(null, null);
+        await extBridge.saveState({ observerLat: null, observerLon: null });
+        renderUI();
+      } else {
+        updateObserverCoordsStatus(getActiveDictionary(), false);
+      }
+      return;
+    }
+
+    const latNum = parseObserverCoord(latRaw);
+    const lonNum = parseObserverCoord(lonRaw);
+    const isValidPair =
+      latNum !== null &&
+      lonNum !== null &&
+      latNum >= -90 &&
+      latNum <= 90 &&
+      lonNum >= -180 &&
+      lonNum <= 180;
+
+    if (isValidPair) {
+      const nextLat = Number(latNum.toFixed(4));
+      const nextLon = Number(lonNum.toFixed(4));
+      if (commitCleanup) {
+        latInputEl.value = String(nextLat);
+        lonInputEl.value = String(nextLon);
+      }
+      if (appState.observerLat !== nextLat || appState.observerLon !== nextLon) {
+        appState.observerLat = nextLat;
+        appState.observerLon = nextLon;
+        setObserverCoords(nextLat, nextLon);
+        await extBridge.saveState({ observerLat: nextLat, observerLon: nextLon });
+        renderUI();
+      } else {
+        updateObserverCoordsStatus(getActiveDictionary(), false);
+      }
+      return;
+    }
+
+    if (commitCleanup && appState.observerLat !== null && appState.observerLon !== null) {
+      latInputEl.value = String(appState.observerLat);
+      lonInputEl.value = String(appState.observerLon);
+      updateObserverCoordsStatus(getActiveDictionary(), false);
+      return;
+    }
+
+    updateObserverCoordsStatus(getActiveDictionary(), true);
+  };
+
+  if (latInputEl && lonInputEl) {
+    latInputEl.addEventListener('input', () => { handleObserverCoordsEdit(false); });
+    lonInputEl.addEventListener('input', () => { handleObserverCoordsEdit(false); });
+    latInputEl.addEventListener('blur', () => { handleObserverCoordsEdit(true); });
+    lonInputEl.addEventListener('blur', () => { handleObserverCoordsEdit(true); });
+  }
+
+  const clearCoordsBtn = document.getElementById('btn-clear-coords');
+  if (clearCoordsBtn) {
+    clearCoordsBtn.addEventListener('click', async () => {
+      if (latInputEl) latInputEl.value = '';
+      if (lonInputEl) lonInputEl.value = '';
+      appState.observerLat = null;
+      appState.observerLon = null;
+      setObserverCoords(null, null);
+      await extBridge.saveState({ observerLat: null, observerLon: null });
+      renderUI();
+    });
+  }
+
   // Notifications (3 independent checkpoint toggles + alarm push notifications)
   const saveNotifs = async () => {
     appState.notifications = {
@@ -3756,13 +3915,23 @@ async function init() {
     }
   }
   appState = await extBridge.loadState();
+  setObserverCoords(appState.observerLat, appState.observerLon);
   bindEvents();
 
   if (HAS_CHROME_EXT && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener(async (changes, area) => {
       if (area !== 'local') return;
-      if (changes.activeAlarm || changes.reminders || changes.birthDate || changes.birthTime || changes.builtinLang) {
+      if (
+        changes.activeAlarm ||
+        changes.reminders ||
+        changes.birthDate ||
+        changes.birthTime ||
+        changes.observerLat ||
+        changes.observerLon ||
+        changes.builtinLang
+      ) {
         appState = await extBridge.loadState();
+        setObserverCoords(appState.observerLat, appState.observerLon);
         renderUI();
       }
     });

@@ -9,7 +9,8 @@ import {
   getCalendarDayLunarSummary,
   computePersonalState,
   findNextDateForLunarDay,
-  getTimeSlot
+  getTimeSlot,
+  setObserverCoords
 } from './astro_engine.js';
 
 const BADGE_ALARM = 'lunar_badge_refresh';
@@ -20,6 +21,8 @@ const ACTIVE_ALARM_BADGE_COLOR = '#E65100';
 const DEFAULT_SETTINGS = {
   birthDate: null,
   birthTime: null,
+  observerLat: null,
+  observerLon: null,
   builtinLang: null,
   dictionaryMode: 'default',
   customDictionary: null,
@@ -69,7 +72,7 @@ async function getState() {
     ? data.builtinLang
     : detectDefaultLang();
 
-  return {
+  const state = {
     ...DEFAULT_SETTINGS,
     ...data,
     builtinLang,
@@ -84,6 +87,8 @@ async function getState() {
     reminders: Array.isArray(data.reminders) ? data.reminders : [],
     activeAlarm: data.activeAlarm || null
   };
+  setObserverCoords(state.observerLat, state.observerLon);
+  return state;
 }
 
 function getActiveDictionary(state) {
@@ -311,6 +316,8 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   if (
     changes.birthDate ||
     changes.birthTime ||
+    changes.observerLat ||
+    changes.observerLon ||
     changes.builtinLang ||
     changes.dictionaryMode ||
     changes.customDictionary ||
@@ -318,7 +325,7 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   ) {
     await updateBadge();
   }
-  if (changes.reminders || changes.notifications) {
+  if (changes.reminders || changes.notifications || changes.observerLat || changes.observerLon) {
     await syncAlarms();
   }
 });
