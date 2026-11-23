@@ -6,14 +6,24 @@ import {
 } from './dictionary_default.js';
 import {
   PHASE_COLORS,
+  ASPECTS,
+  PLANET_ORB,
   formatHM,
+  fromJulianDay,
   getCalendarDayLunarSummary,
+  getLunarDayAt,
+  getLunationIntervals,
   getMoonPhaseInfo,
+  getPlanetLongitudes,
   getTimeSlot,
+  getZodiacSign,
+  buildLayeredAspectGraph,
   computePersonalState,
   computeRawDiagnosticData,
   findNextDateForLunarDay,
-  parseBirthDateString
+  parseBirthDateString,
+  signedAngleDiff,
+  toJulianDay
 } from './astro_engine.js';
 
 // =========================================================================
@@ -1271,9 +1281,528 @@ function buildBriefingSpeechText() {
   return sentences.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
 
+/* =========================================================================
+   Промпт для внешней ИИ-модели — «максимум математики, минимум рамок».
+
+   Принципы:
+   * Максимум фактов, минимум решений. Всё, что движок умеет считать, передаётся
+     целиком; всё, что движок уже решил (фаза, роль, главный аспект), остаётся
+     его решением — модель получает его как рамку и не оспаривает.
+   * Рамка ≠ лексикон. Рамка (указание «что делать») в промпт не попадает;
+     лексикон (подпись «что это») попадает обязательно — иначе модель выдумывает
+     смысл незнакомых категорий.
+   * Предмет прогноза — лунные сутки, а не календарный день. Календарный день —
+     маска, через которую пользователь видит часть лунных суток: хвост активных
+     суток плюс начало следующих, которые переходят на следующий календарный день.
+   ========================================================================= */
+
+// Окна календарного дня, по которым раскладывается оставшаяся часть суток.
+const PROMPT_DAY_WINDOWS = [
+  { key: 'morning', hour: 9 },
+  { key: 'day', hour: 14 },
+  { key: 'evening', hour: 20 },
+  { key: 'night', hour: 23 }
+];
+
+// Планеты для суточной скорости (транзит → транзит включает и Солнце).
+const PROMPT_SKY_PLANETS = [
+  'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto'
+];
+const PROMPT_SKY_ASPECT_BODIES = ['Sun', ...PROMPT_SKY_PLANETS];
+
+// Резервные заголовки на случай, если в словаре нет ui_labels.ai_forecast_title.
+const FALLBACK_FORECAST_TITLES = {
+  'ru-RU': 'Астрологический прогноз на день',
+  'ru': 'Астрологический прогноз на день',
+  'en-US': 'Daily Astrological Forecast',
+  'en': 'Daily Astrological Forecast',
+  'es-ES': 'Pronóstico astrológico del día',
+  'es': 'Pronóstico astrológico del día',
+  'de-DE': 'Astrologische Tagesprognose',
+  'de': 'Astrologische Tagesprognose',
+  'fr-FR': 'Prévision astrologique du jour',
+  'fr': 'Prévision astrologique du jour'
+};
+
+// Дескриптор авторской строки словаря: только «что это за категория».
+// Вторая часть строки — директива («что делать») — в промпт не попадает.
+function getCategoryDescriptor(text) {
+  const clean = String(text || '').trim();
+  if (!clean) return '';
+  const match = clean.match(/^[^.!?]+[.!?]?/);
+  return (match ? match[0] : clean).replace(/[.!?\s]+$/g, '').trim();
+}
+
+// Для строк вида «описание — директива» (aspect_dynamics): берём часть до тире.
+function getClauseDescriptor(text) {
+  return String(text || '').split(/\s+[—–]\s+/)[0].trim();
+}
+
+function getPromptDayRelation(targetDate, now = new Date()) {
+  const targetStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate()).getTime();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (targetStart < todayStart) return 'past';
+  if (targetStart > todayStart) return 'future';
+  return 'today';
+}
+
+// Границы лунных суток вокруг опорного момента — с датами, а не только часами.
+function getLunarDayBoundaries(targetDate, refMoment) {
+  const dayStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 0, 0, 0, 0);
+  const dayEnd = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 23, 59, 59, 999);
+  const jd0 = toJulianDay(dayStart);
+  const jd1 = toJulianDay(dayEnd);
+  const lun1 = getLunationIntervals(jd0);
+  const lun2 = jd1 >= lun1.nmNext ? getLunationIntervals(jd1) : null;
+  const all = lun2 ? [...lun1.intervals, ...lun2.intervals] : lun1.intervals;
+  const refJD = toJulianDay(refMoment);
+  const active = all.find((iv) => refJD >= iv.startJD && refJD < iv.endJD) || all[0];
+  const idx = all.indexOf(active);
+  const prev = idx > 0 && active.startJD > jd0 ? all[idx - 1] : null;
+  const next = idx >= 0 && idx + 1 < all.length ? all[idx + 1] : null;
+  return {
+    activeDay: active.day,
+    activeStart: fromJulianDay(active.startJD),
+    activeEnd: fromJulianDay(active.endJD),
+    activeStartsSameDay: active.startJD >= jd0 && active.startJD <= jd1,
+    activeEndsSameDay: active.endJD >= jd0 && active.endJD <= jd1,
+    prevDay: prev ? prev.day : null,
+    prevStart: prev ? fromJulianDay(prev.startJD) : null,
+    prevEnd: prev ? fromJulianDay(prev.endJD) : null,
+    nextDay: next ? next.day : null,
+    nextStart: next ? fromJulianDay(next.startJD) : null,
+    nextStartsSameDay: Boolean(next && next.startJD >= jd0 && next.startJD <= jd1)
+  };
+}
+
+// Окна календарного дня: положение Луны, «уже прошло» и номер лунных суток.
+function getPromptDayWindows(targetDate, refMoment, now = new Date()) {
+  const dayRelation = getPromptDayRelation(targetDate, now);
+  return PROMPT_DAY_WINDOWS.map((slot) => {
+    const at = new Date(
+      targetDate.getFullYear(),
+      targetDate.getMonth(),
+      targetDate.getDate(),
+      slot.hour,
+      0,
+      0,
+      0
+    );
+    const info = getMoonPhaseInfo(at);
+    const passed =
+      dayRelation === 'past'
+        ? true
+        : dayRelation === 'future'
+          ? false
+          : slot.hour < refMoment.getHours();
+    const lunar = getLunarDayAt(at);
+    return {
+      key: slot.key,
+      hour: slot.hour,
+      moonLon: Number(info.moonLon.toFixed(2)),
+      sign: info.zodiacSign,
+      passed,
+      lunarDay: lunar.day
+    };
+  });
+}
+
+// Знаковая суточная скорость планеты: отрицательная — ретроградное движение.
+function getSignedDailySpeed(planetName, refMoment) {
+  const prev = getPlanetLongitudes(new Date(refMoment.getTime() - 12 * 3600000), [planetName])[planetName];
+  const next = getPlanetLongitudes(new Date(refMoment.getTime() + 12 * 3600000), [planetName])[planetName];
+  return signedAngleDiff(next, prev);
+}
+
+function getAngularSeparation(angleA, angleB) {
+  let diff = Math.abs(angleA - angleB) % 360;
+  if (diff > 180) diff = 360 - diff;
+  return diff;
+}
+
+// Орбит пары — минимум из орбит её тел.
+function getPairOrbLimit(nameA, nameB) {
+  const limitFor = (name) => {
+    if (name === 'Sun' || name === 'Moon') return 2.0;
+    return PLANET_ORB[name] ?? 1.0;
+  };
+  return Math.min(limitFor(nameA), limitFor(nameB));
+}
+
+// «Слой неба»: аспекты между транзитными планетами (включая Солнце).
+function computeSkyAspects(refMoment) {
+  const lons = getPlanetLongitudes(refMoment, PROMPT_SKY_ASPECT_BODIES);
+  const found = [];
+  for (let i = 0; i < PROMPT_SKY_ASPECT_BODIES.length; i++) {
+    for (let j = i + 1; j < PROMPT_SKY_ASPECT_BODIES.length; j++) {
+      const from = PROMPT_SKY_ASPECT_BODIES[i];
+      const to = PROMPT_SKY_ASPECT_BODIES[j];
+      const limit = getPairOrbLimit(from, to);
+      for (const asp of ASPECTS) {
+        const orb = Math.abs(getAngularSeparation(lons[from], lons[to]) - asp.angle);
+        if (orb <= limit) found.push({ from, to, aspectKey: asp.key, angle: asp.angle, orb });
+      }
+    }
+  }
+  return found.sort((x, y) => x.orb - y.orb);
+}
+
+// Аспекты внутри натальной карты.
+function computeNatalAspects(natalPlanets) {
+  if (!natalPlanets) return [];
+  const names = Object.keys(natalPlanets);
+  const found = [];
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const from = names[i];
+      const to = names[j];
+      const limit = getPairOrbLimit(from, to);
+      for (const asp of ASPECTS) {
+        const orb = Math.abs(
+          getAngularSeparation(natalPlanets[from].longitude, natalPlanets[to].longitude) - asp.angle
+        );
+        if (orb <= limit) found.push({ from, to, aspectKey: asp.key, angle: asp.angle, orb });
+      }
+    }
+  }
+  return found.sort((x, y) => x.orb - y.orb);
+}
+
+// Слой «вчера / позавчера» — тот же движок, что считает карточку.
+function getPromptHistoryLayer(birthDateStr, birthTimeStr, targetDate, refMoment) {
+  if (!birthDateStr) return null;
+  try {
+    const birthObj = parseBirthDateString(birthDateStr, birthTimeStr);
+    if (!birthObj) return null;
+    return buildLayeredAspectGraph(birthObj, targetDate, refMoment);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Блок астрономических данных: всё, что движок посчитал, без авторских выводов.
+ */
+function buildAstronomyDataBlock(raw, summary, dict, ctx) {
+  const lines = [];
+  const lunar = raw.lunar || {};
+  const phaseInfo = summary.phaseInfo || {};
+  const signName = (canonical) => getLocalizedZodiacSign(dict, canonical);
+  const deg = (value) => `${Number(value).toFixed(2)}°`;
+  const trendLabel = dict.moon_phase_names?.[lunar.detailedTrend] || lunar.detailedTrend;
+  const ddmm = (d) =>
+    `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const bounds = ctx.boundaries;
+
+  lines.push(
+    `- Date: ${ctx.isoDate} (${ctx.dayRelation}) | reference moment (local): ${ctx.currentTimeStr} | time slot: ${ctx.activeTimeSlot}`
+  );
+  lines.push('');
+  lines.push('LUNAR GEOMETRY');
+  lines.push(
+    `- Moon age: ${Number(phaseInfo.moonAge).toFixed(2)} days since the last exact new moon`
+  );
+  lines.push(
+    `- Sun-Moon elongation: ${deg(phaseInfo.elong)} (angular distance between the directions to the Sun and to the Moon)`
+  );
+  lines.push(
+    `- Illuminated fraction of the disc: ${Number(phaseInfo.illuminationExact).toFixed(1)} %`
+  );
+  lines.push(
+    `- Current lunar phase: ${trendLabel} (${lunar.detailedTrend}), ${phaseInfo.isWaxing ? 'waxing' : 'waning'}`
+  );
+  lines.push(`- Moon ecliptic longitude: ${deg(phaseInfo.moonLon)} -> sign ${signName(phaseInfo.zodiacSign)}`);
+  lines.push(
+    `- Sun ecliptic longitude: ${deg(phaseInfo.sunLon)} -> sign ${signName(getZodiacSign(phaseInfo.sunLon))}`
+  );
+  if (summary.signIngress) {
+    lines.push(
+      `- Moon sign ingress during the day: ${signName(summary.signIngress.fromSign)} -> ${signName(summary.signIngress.toSign)} at ${summary.signIngress.timeStr}`
+    );
+  }
+  lines.push(
+    `- First moonrise / first moonset inside the calendar day: ${summary.moonriseStr} / ${summary.moonsetStr}`
+  );
+  lines.push('');
+
+  lines.push('THE DAY IN FOUR WINDOWS (the Moon moves through the day; each window belongs to a lunar day)');
+  for (const win of ctx.windows) {
+    const passed = win.passed ? ' — already passed' : '';
+    lines.push(
+      `- ${win.key} (${String(win.hour).padStart(2, '0')}:00): Moon in ${signName(win.sign)} (${deg(win.moonLon)}), lunar day ${win.lunarDay}${passed}`
+    );
+  }
+  lines.push('');
+
+  lines.push(
+    'LUNAR DAYS AND THE DYNAMICS VECTOR (a lunar day runs from one moonrise to the next and usually spans two calendar days)'
+  );
+  const activeNote = getCategoryDescriptor(dict.lunar_days?.[String(bounds.activeDay)] || '');
+  const activeEdge = raw.personal?.dailyFocusEdge;
+  lines.push(
+    `- ${toEnglishOrdinal(bounds.activeDay)} (active at the reference moment): "${activeNote}" | window ${ddmm(bounds.activeStart)} ${formatHM(bounds.activeStart)} -> ${ddmm(bounds.activeEnd)} ${formatHM(bounds.activeEnd)}`
+  );
+  let dynamics =
+    `    dynamics: the Moon is ${phaseInfo.isWaxing ? 'waxing' : 'waning'} at ${Number(phaseInfo.illuminationExact).toFixed(1)} % illumination (${lunar.detailedTrend}), Moon age ${Number(phaseInfo.moonAge).toFixed(2)} d`;
+  if (activeEdge) {
+    const peakPart =
+      typeof activeEdge.peakHour === 'number'
+        ? `, the aspect becomes exact around ${String(activeEdge.peakHour).padStart(2, '0')}:00`
+        : '';
+    dynamics += `, and the day leans on ${activeEdge.transit} -> natal ${activeEdge.natal}: ${activeEdge.aspectKey} (${activeEdge.dynamicKey}${peakPart})`;
+  }
+  lines.push(dynamics);
+  if (bounds.prevDay !== null) {
+    const prevNote = getCategoryDescriptor(dict.lunar_days?.[String(bounds.prevDay)] || '');
+    lines.push(
+      `- ${toEnglishOrdinal(bounds.prevDay)} (earlier portion of the same calendar day, ended ${ddmm(bounds.prevEnd)} at ${formatHM(bounds.prevEnd)}): "${prevNote}"`
+    );
+  }
+  if (bounds.nextStart) {
+    const nextNote = getCategoryDescriptor(dict.lunar_days?.[String(bounds.nextDay)] || '');
+    const sameDayTag = bounds.nextStartsSameDay ? 'later inside the same calendar day' : 'on the next calendar day';
+    lines.push(
+      `- ${toEnglishOrdinal(bounds.nextDay)} (begins ${ddmm(bounds.nextStart)} at ${formatHM(bounds.nextStart)}, ${sameDayTag}): "${nextNote}"`
+    );
+  }
+  lines.push('');
+
+  lines.push('PLANETARY POSITIONS AT THE REFERENCE MOMENT (geocentric ecliptic longitude)');
+  const transitParts = Object.entries(raw.transitPlanets || {}).map(
+    ([name, p]) => `${name} ${deg(p.longitude)} (${signName(p.sign)})`
+  );
+  lines.push(`- Sun ${deg(phaseInfo.sunLon)} (${signName(getZodiacSign(phaseInfo.sunLon))})`);
+  lines.push(`- ${transitParts.join(' · ')}`);
+  lines.push('');
+  lines.push('DAILY MOTION (signed longitude change over 24 h; negative = retrograde)');
+  for (const planet of PROMPT_SKY_PLANETS) {
+    const speed = getSignedDailySpeed(planet, ctx.refMoment);
+    lines.push(
+      `- ${planet}: ${Math.abs(speed).toFixed(3)}°/day, ${speed < 0 ? 'retrograde' : 'direct'}`
+    );
+  }
+  lines.push('');
+
+  if (raw.natalPlanets) {
+    lines.push('NATAL POSITIONS (from the birth data supplied by the user)');
+    const natalParts = Object.entries(raw.natalPlanets).map(
+      ([name, p]) => `${name} ${deg(p.longitude)} (${signName(p.sign)})`
+    );
+    lines.push(`- ${natalParts.join(' · ')}`);
+    lines.push('');
+  }
+
+  lines.push(
+    'ACTIVE ASPECTS (transit body -> natal body; orb = current deviation from the exact angle)'
+  );
+  const aspects = raw.allAspectsWithinOrb || [];
+  if (aspects.length) {
+    for (const a of aspects) {
+      lines.push(
+        `- ${a.transit} -> natal ${a.natal}: ${a.aspectKey} (exact angle ${a.angle}°, orb ${Number(a.diff).toFixed(2)}°, ${a.dynamicKey}, ${a.layer} layer)`
+      );
+    }
+  } else {
+    lines.push('- none within orb');
+  }
+  lines.push('');
+
+  lines.push("SKY ASPECTS (transit body -> transit body; the mutual geometry of today's sky)");
+  const skyAspects = computeSkyAspects(ctx.refMoment);
+  if (skyAspects.length) {
+    for (const a of skyAspects) {
+      lines.push(
+        `- ${a.from} -> ${a.to}: ${a.aspectKey} (exact angle ${a.angle}°, orb ${a.orb.toFixed(2)}°)`
+      );
+    }
+  } else {
+    lines.push('- none within the per-planet orb');
+  }
+  lines.push('');
+
+  lines.push('NATAL ASPECTS (natal body -> natal body; the standing structure of the birth chart)');
+  const natalAspects = computeNatalAspects(raw.natalPlanets);
+  if (natalAspects.length) {
+    for (const a of natalAspects) {
+      lines.push(
+        `- ${a.from} -> ${a.to}: ${a.aspectKey} (exact angle ${a.angle}°, orb ${a.orb.toFixed(2)}°)`
+      );
+    }
+  } else {
+    lines.push('- none within the per-planet orb');
+  }
+  lines.push('');
+
+  lines.push(
+    'LUNAR ASPECTS AND THEIR PEAK TIMES (Moon aspects reaching exact peak inside this calendar day)'
+  );
+  const moonEdges = (raw.personal?.prioritizedFastEdges || []).filter((e) => e.transit === 'Moon');
+  if (moonEdges.length) {
+    for (const e of moonEdges) {
+      const peak =
+        typeof e.peakHour === 'number' ? `, peak around ${String(e.peakHour).padStart(2, '0')}:00` : '';
+      lines.push(
+        `- ${e.transit} -> natal ${e.natal}: ${e.aspectKey} (exact angle ${e.angle}°, orb at peak ${Number(e.diff).toFixed(2)}°, ${e.dynamicKey}${peak})`
+      );
+    }
+  } else {
+    lines.push('- none completing an exact peak inside this calendar day');
+  }
+  lines.push('');
+
+  if (ctx.history) {
+    lines.push('YESTERDAY AND THE DAY BEFORE (the engine compares today with the previous two days)');
+    const formatEdges = (edges) =>
+      (edges || [])
+        .slice(0, 3)
+        .map(
+          (e) =>
+            `${e.transit} -> natal ${e.natal}: ${e.aspectKey} (${e.dynamicKey}${
+              typeof e.peakHour === 'number' ? `, peak ${String(e.peakHour).padStart(2, '0')}:00` : ''
+            })`
+        )
+        .join(' · ');
+    const yesterday = new Date(
+      ctx.targetDate.getFullYear(),
+      ctx.targetDate.getMonth(),
+      ctx.targetDate.getDate() - 1
+    );
+    const dayBefore = new Date(
+      ctx.targetDate.getFullYear(),
+      ctx.targetDate.getMonth(),
+      ctx.targetDate.getDate() - 2
+    );
+    lines.push(
+      `- Yesterday (${ddmm(yesterday)}): ${formatEdges(ctx.history.prev1Edges) || 'none'}`
+    );
+    lines.push(
+      `- The day before (${ddmm(dayBefore)}): ${formatEdges(ctx.history.prev2Raw?.combined) || 'none'}`
+    );
+    lines.push(
+      '- The engine lowers the priority of a focus that repeats the previous day, so a change of focus between yesterday and today is itself a signal.'
+    );
+  }
+
+  return lines;
+}
+
+/**
+ * Метрики персонального 29,5-дневного цикла: числа и ключи классификации,
+ * без авторских формулировок словаря на сегодняшний день.
+ */
+function buildPersonalRhythmBlock(raw) {
+  const lines = [];
+  const personal = raw.personal;
+
+  if (!personal) {
+    lines.push(
+      '- no birth data supplied: the personal 29.53-day cycle, the birth rhythm profile and the natal aspects cannot be computed'
+    );
+    return lines;
+  }
+
+  lines.push(
+    `- Birth data used: ${raw.input?.birthDate || '—'}${
+      raw.input?.birthTime ? `, ${raw.input.birthTime}` : ''
+    }`
+  );
+  lines.push(
+    `- Moon age at birth: ${Number(personal.birthMoonAge).toFixed(2)} days — the zero point of the 29.53-day cycle`
+  );
+  lines.push(
+    `- Current position in the personal cycle: ${Number(personal.personalPhase).toFixed(2)} days since that zero point (cycle length 29.53 days)`
+  );
+  lines.push(`- Profile: ${personal.profileKey}`);
+  lines.push(`- Age class: ${personal.ageClassKey}`);
+  lines.push(`- Time slot of the reference moment: ${personal.timeSlot}`);
+  lines.push(
+    '- The engine assigns the operational role and the primary aspect; its internal weights are not part of the input and the ranking is not open for revision.'
+  );
+
+  return lines;
+}
+
+/**
+ * Глоссарий таксономии активного словаря — только подписи категорий.
+ *
+ * Дескриптор (что это за категория) нужен модели обязательно: без него она
+ * выдумывает смысл незнакомых ключей. Директива (что делать) — это рамка
+ * карточки, и она сюда не попадает.
+ */
+function buildInterpretiveGlossary(dict) {
+  const lines = [];
+
+  lines.push('PHASES (personal 29.53-day cycle)');
+  for (const [key, phase] of Object.entries(dict.phases || {})) {
+    const parts = [phase.badge || phase.title || key, phase.tempo, phase.action].filter(Boolean);
+    lines.push(`- ${key}: ${parts.join('; ')}`);
+  }
+  lines.push('');
+
+  lines.push('ROLES (operational modes)');
+  for (const [key, role] of Object.entries(dict.roles || {})) {
+    lines.push(`- ${key}: ${role.title || key}${role.hint ? ` — ${role.hint}` : ''}`);
+  }
+  lines.push('');
+
+  lines.push('ACTORS (life areas a planet acts through)');
+  for (const [key, actor] of Object.entries(dict.actors || {})) {
+    lines.push(`- ${key}: ${actor.title || key}${actor.domain ? ` — ${actor.domain}` : ''}`);
+  }
+  lines.push('');
+
+  lines.push('ASPECT TYPES');
+  for (const [key, maneuver] of Object.entries(dict.maneuvers || {})) {
+    const angle = ASPECTS.find((a) => a.key === key)?.angle;
+    const valence = maneuver.valence ? ` [${maneuver.valence}]` : '';
+    lines.push(`- ${key}${angle !== undefined ? `: ${angle}°` : ''} — ${maneuver.title || key}${valence}`);
+  }
+  lines.push('');
+
+  lines.push('ASPECT DYNAMICS');
+  for (const [key, text] of Object.entries(dict.aspect_dynamics || {})) {
+    lines.push(`- ${key}: ${getClauseDescriptor(text)}`);
+  }
+  lines.push('');
+
+  lines.push('SIGNS');
+  for (const [canonical, localized] of Object.entries(dict.zodiac_names || {})) {
+    const hint = dict.zodiac_hints?.[canonical];
+    if (hint) lines.push(`- ${localized}: ${hint}`);
+  }
+  lines.push('');
+
+  lines.push('PROFILES');
+  for (const [key, profile] of Object.entries(dict.profiles || {})) {
+    lines.push(`- ${key}: ${profile.title || key}${profile.short_desc ? ` — ${profile.short_desc}` : ''}`);
+  }
+  lines.push('');
+
+  lines.push('AGE CLASSES');
+  for (const [key, ageClass] of Object.entries(dict.age_classes || {})) {
+    lines.push(
+      `- ${key}: ${ageClass.title || key}${
+        ageClass.modifier_hint ? ` — ${getCategoryDescriptor(ageClass.modifier_hint)}` : ''
+      }`
+    );
+  }
+  lines.push('');
+
+  return lines;
+}
+
+/**
+ * Собирает промпт для внешней ИИ-модели.
+ *
+ * Принцип: максимум нашей математики, минимум рамок. Приложение отдаёт всё, что
+ * посчитало, и словарь категорий; готовый прогноз карточки сюда не попадает —
+ * иначе промпт превращался бы в задание «перепиши карточку».
+ */
 function buildExternalAIPrompt() {
   const dict = getActiveDictionary();
   const lang = dict.meta?.lang || 'ru-RU';
+  const baseLang = lang.toLowerCase().split(/[-_]/)[0];
+  const targetLangName = resolveLanguageNameEn(lang);
   const now = new Date();
   const isToday = isSameCalendarDay(selectedDate, now);
   const refMoment = isToday
@@ -1281,166 +1810,157 @@ function buildExternalAIPrompt() {
     : new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0, 0, 0);
 
   const summary = getCalendarDayLunarSummary(selectedDate, refMoment);
-  const personal = appState.birthDate
-    ? computePersonalState(appState.birthDate, selectedDate, refMoment, appState.birthTime)
-    : null;
+  const raw = computeRawDiagnosticData(
+    appState.birthDate,
+    appState.birthTime,
+    selectedDate,
+    refMoment
+  );
 
-  const isoDate = toISODate(selectedDate);
-  const humanDate = formatHumanDate(selectedDate, lang);
-  const currentTimeStr = formatHM(refMoment);
-  const activeTimeSlot = personal ? personal.timeSlot : getTimeSlot(refMoment);
+  const boundaries = getLunarDayBoundaries(selectedDate, refMoment);
+  const ddmm = (d) =>
+    `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const dayRelation = getPromptDayRelation(selectedDate, now);
 
-  const sign = summary.phaseInfo.zodiacSign;
-  const zodiacHint = dict.zodiac_hints?.[sign] || '';
-  const firstNote = dict.lunar_days?.[String(summary.firstDay)] || '';
-  const secondNote = dict.lunar_days?.[String(summary.secondDay)] || '';
-  const lunarDayNote = dict.lunar_days?.[String(summary.activeLunarDay)] || '';
-  const detailedTrend =
-    dict.moon_phase_names?.[summary.phaseInfo.detailedTrend] ||
-    dict.moon_trends?.[summary.phaseInfo.trend] ||
-    summary.phaseInfo.trend;
-  const targetLangName = resolveLanguageNameEn(lang);
+  const ctx = {
+    dict,
+    lang,
+    targetLangName,
+    dayRelation,
+    isoDate: toISODate(selectedDate),
+    humanDate: formatHumanDate(selectedDate, lang),
+    currentTimeStr: formatHM(refMoment),
+    activeTimeSlot: raw.personal?.timeSlot || getTimeSlot(refMoment),
+    targetDate: selectedDate,
+    refMoment,
+    boundaries,
+    windows: getPromptDayWindows(selectedDate, refMoment, now),
+    history: getPromptHistoryLayer(
+      appState.birthDate,
+      appState.birthTime,
+      selectedDate,
+      refMoment
+    ),
+    title:
+      dict.ui_labels?.ai_forecast_title ||
+      FALLBACK_FORECAST_TITLES[lang] ||
+      FALLBACK_FORECAST_TITLES[baseLang] ||
+      FALLBACK_FORECAST_TITLES['en-US']
+  };
+
+  const hasBirthData = Boolean(raw.personal);
+  const activeOrdinal = toEnglishOrdinal(ctx.boundaries.activeDay);
+  let activeDayPhrase =
+    `the ${activeOrdinal} lunar day runs from ${ddmm(ctx.boundaries.activeStart)} at ${formatHM(
+      ctx.boundaries.activeStart
+    )} to ${ddmm(ctx.boundaries.activeEnd)} at ${formatHM(ctx.boundaries.activeEnd)}`;
+  if (ctx.boundaries.prevDay !== null) {
+    activeDayPhrase +=
+      `, having replaced the ${toEnglishOrdinal(ctx.boundaries.prevDay)} lunar day earlier on ${ctx.humanDate} at ${formatHM(
+        ctx.boundaries.activeStart
+      )}` +
+      (ctx.boundaries.nextStartsSameDay
+        ? ` before the ${toEnglishOrdinal(ctx.boundaries.nextDay)} begins at ${formatHM(ctx.boundaries.nextStart)}`
+        : ' and continuing into the next calendar day');
+  } else if (ctx.boundaries.nextStartsSameDay) {
+    activeDayPhrase += `, so the visible slice of ${ctx.humanDate} is the tail of that lunar day followed by the beginning of the ${toEnglishOrdinal(
+      ctx.boundaries.nextDay
+    )} at ${formatHM(ctx.boundaries.nextStart)}, which continues into the next calendar day`;
+  } else {
+    activeDayPhrase += `, spanning all of ${ctx.humanDate}`;
+  }
+
+  const timeHorizonLine =
+    dayRelation === 'today'
+      ? `The reference moment is ${ctx.currentTimeStr} (current local time). The day is divided below into morning / day / evening / night, and the windows that have already passed are marked as such.`
+      : dayRelation === 'future'
+        ? `${ctx.humanDate} is a future calendar date (reference snapshot at ${ctx.currentTimeStr}). All four intraday windows (morning / day / evening / night) are still ahead.`
+        : `${ctx.humanDate} is a past calendar date (reference snapshot at ${ctx.currentTimeStr}). All four intraday windows (morning / day / evening / night) have already passed.`;
 
   const lines = [
-    'You are an analytical daily rhythm and productivity strategist.',
-    'Generate a cohesive, practical, realistic plan of action for the selected day based STRICTLY on the pre-computed astronomical and personal telemetry below.',
-    'Treat all supplied telemetry as ground truth. DO NOT recalculate planetary positions, lunar days, aspects, or phases on your own.',
+    `You are an astrologer-analyst. Write the daily horoscope for ${ctx.humanDate}`,
     '',
-    '### RULES & CONSTRAINTS',
-    `1. OUTPUT CONTRACT & STRICT MONOLINGUAL HEADINGS: Structure your response into strictly 6 numbered sections. Output section titles strictly in ${targetLangName} ONLY (do NOT output bilingual slashes or English translations in the response headings; use these English structural topics purely as internal reference: 1) Remainder of Day Framing, 2) Priorities, 3) Communication, 4) Pacing & Breaks, 5) Recovery, 6) Clarifying Questions). Keep each section concise with a maximum of 7 bullet points per section.`,
-    `2. EVENING & TIME HORIZON (timeSlot: ${activeTimeSlot}): When timeSlot === "evening", plan ONLY from Current Local Time (${currentTimeStr}) until bedtime (assume 23:00 by default if bedtime is unknown, and explicitly state this assumption). When timeSlot === "day", plan strictly from midday/current time onward.`,
-    '3. LATE-NIGHT CUTOFF (< 60 MINS TO BEDTIME): If less than 60 minutes remain before bedtime (23:00 default), collapse the entire action plan into ONE single closing micro-action plus the evening recovery ritual.',
-    '4. NO PAST OR DAYTIME-ONLY TASKS AT NIGHT: Strictly forbid scheduling past hours, morning routines, or daytime-only work/preparations when in the evening window. Only neutral evening preparation for tomorrow morning is allowed (e.g., laying out clothes, clearing the desk, setting an alarm).',
-    '5. PRIORITY CAP (MAX 2): In Section 2 (Priorities), list strictly NO MORE than 2 priority tasks for the remainder of the evening (or current time window) to prevent schedule overload.',
-    '6. CONFLICT RESOLUTION & EXPLICIT IMPULSE NEUTRALIZATION: Whenever an active operational role (e.g., Sprint / Drive) or fast zodiac/aspect hints (e.g., Aries / initiative / fast decisions) coincide with a low-energy personal phase (phase_minimum / phase_decline), explicitly neutralize any impulse to start new tasks, cold outreach, or new projects — channel speed strictly into closing already-started short items and replying to incoming messages.',
-    '7. COMMUNICATION SPLIT (REPLY VS INITIATE): Separate incoming replies from outgoing initiation. During evening hours or low personal pacing, allow replying to incoming requests, and allow initiating messages ONLY if they directly close an open task or handoff. Do not start new discussions or open-ended threads.',
-    '8. LUNAR DAY TRANSITION RULE: Treat the currently active lunar day as primary for all actionable guidance. Treat any earlier/previous lunar day strictly as passive background context without mixing conflicting advice. On any conflict, the active lunar day combined with the personal rest/pacing phase takes priority.',
-    '9. REALISM & TIME-BOXING: Every suggested action must realistically fit into the remaining time window before bedtime or end of day. Any task requiring more than 30-40 minutes must be broken down into a concrete minimal next step or explicitly deferred to tomorrow.',
-    `10. TELEMETRY TRANSLATION (NO PARROTING): Do NOT repeat, quote, or paraphrase raw telemetry numbers, degrees, orb values, or status fields in your output. Translate telemetry directly into actionable behavior using the voice of the active dictionary ("${dict.meta?.name || 'Default'}" — ${dict.meta?.description || 'Rational productivity without esotericism.'}) without adding extra astrology or unrequested esotericism.`,
-    '11. GLOBAL LENGTH & FORMAT CAP: Keep the entire response concise within 450-600 words maximum, formatted in clean bullet points, with NO Markdown tables and ZERO repetition of raw telemetry numbers.',
-    '12. UNCERTAINTY HANDLING: If key context is missing (such as exact bedtime, specific pending documents, or deadlines), deliver the complete plan first using explicit, stated assumptions, then ask 1-2 brief clarifying questions at the very end in Section 6 (strictly max 2 questions).',
-    '13. FINAL QUALITY SELF-CHECK: Before finalizing, verify that your output uses strictly monolingual headings, stays within 450-600 words without Markdown tables, lists max 2 priorities, contains zero medical diagnoses/prescriptions, zero fatalistic claims, zero metaphors/esotericism (unless explicitly defined by a custom active dictionary), zero tasks for past hours, full respect for low personal pacing, and includes at least one deliberate pause plus a concrete evening recovery ritual.',
+    'Everything you are given is below: the sky data for that day, the personal-cycle metrics, the app engine own read of the day,',
+    'and the vocabulary the app uses for its categories. There is no ready-made forecast and nothing else is available to you —',
+    'the reading does not exist until you write it. The structure, the length and the emphasis are entirely yours.',
+    'Write for a person who knows nothing about astrology and is busy: explain every term in plain language, and turn the numbers into prose rather than printing them.',
+    `The whole answer must be written in ${targetLangName}.`,
+    `The answer opens with the title «${ctx.title}» — that is the heading of the whole forecast, so the sky is not opened as a separate section with a heading of its own.`,
     '',
-    '### PRE-COMPUTED TELEMETRY',
-    `- Selected Date: ${isoDate} (${humanDate})`,
-    `- Current Local Time: ${currentTimeStr} (timeSlot: ${activeTimeSlot})`
+    '### THE SUBJECT IS THE LUNAR DAY, NOT THE CALENDAR DAY',
+    'A lunar day runs from one moonrise to the next and usually spans two calendar days; the calendar day is only the mask',
+    `through which the user sees it. Here ${activeDayPhrase}.`,
+    'Describe the lunar day as a whole, and give the actionable guidance for the part of it that is still ahead.',
+    timeHorizonLine,
+    ...(hasBirthData
+      ? []
+      : [
+          'No birth date was supplied, so the personal 29.5-day cycle cannot be read for this day: work from the sky alone, say plainly that the personal cycle is unavailable, and do not invent one.'
+        ]),
+    '',
+    '### RULES',
+    '1. GROUND TRUTH. The positions, angles, orbs, timings and classifications below come from the app own ephemeris engine. Never recompute, correct or second-guess them.',
+    "2. THE FRAME IS THE ENGINE DECISION, NOT A SUGGESTION. The phase, the stage, the profile, the age class, the operational role and the primary aspect listed under THE ENGINE'S READING OF TODAY are the app own verdict for this day. Interpret them, never overturn them and never tell the user that the app chose otherwise.",
+    '3. NO FATALISM, NO HEALTH CLAIMS. Never claim that the sky determines fate, and never make medical, psychological or hormonal claims.',
+    '',
+    '### ASTRONOMICAL DATA (ground truth)',
+    ...buildAstronomyDataBlock(raw, summary, dict, ctx),
+    '',
+    '### PERSONAL CYCLE (same engine + the birth data of the user)',
+    ...buildPersonalRhythmBlock(raw),
+    '',
+    "### THE ENGINE'S READING OF TODAY (the frame — interpret, do not overturn)"
   ];
 
-  if (summary.firstDay !== summary.secondDay) {
-    lines.push(
-      `- Lunar Day Timeline: ${toEnglishOrdinal(summary.firstDay)} lunar day (from ${summary.firstDayStartTimeStr}) until ${summary.transitionTimeStr}, followed by ${toEnglishOrdinal(summary.secondDay)} lunar day (starts at ${summary.secondDayStartTimeStr}); primary active now: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day`
-    );
-    if (summary.activeIndex === 0) {
-      if (firstNote) lines.push(`- Primary Active Lunar Day (${summary.firstDay}): ${firstNote}`);
-      if (secondNote) lines.push(`- Upcoming Lunar Day Context (after ${summary.transitionTimeStr}, ${summary.secondDay}): ${secondNote}`);
-    } else {
-      if (firstNote) lines.push(`- Previous Background Lunar Day (${summary.firstDay}, ended at ${summary.transitionTimeStr}): ${firstNote}`);
-      if (secondNote) lines.push(`- Primary Active Lunar Day (${summary.secondDay}): ${secondNote}`);
-    }
-  } else {
-    lines.push(
-      `- Lunar Day Timeline: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day all day (from ${summary.firstDayStartTimeStr}, next transition at ${summary.transitionTimeStr}); primary active now: ${toEnglishOrdinal(summary.activeLunarDay)} lunar day`
-    );
-    if (lunarDayNote) lines.push(`- Primary Active Lunar Day (${summary.activeLunarDay}): ${lunarDayNote}`);
-  }
-
-  const dayThemeObj = getDayTheme(dict, sign);
-  const ingressLine = summary.signIngress
-    ? `- Exact Moon Sign Ingress Today: ${summary.signIngress.fromSign} -> ${summary.signIngress.toSign} at ${summary.signIngress.timeStr}`
-    : null;
-  lines.push(
-    `- Moon Phase & Illumination: ${detailedTrend}, Moon age ${summary.phaseInfo.moonAge.toFixed(1)} days, ${summary.phaseInfo.illuminationExact.toFixed(1)}% illuminated`,
-    `- Moon Zodiac Sign: ${sign} (${zodiacHint})${dayThemeObj ? `; Daily Theme: ${dayThemeObj.title} — ${dayThemeObj.focus}` : ''}`,
-    ...(ingressLine ? [ingressLine] : []),
-    `- Intra-day Moon Sign Windows: Morning 09:00 = ${summary.windows.morning.zodiacSign}, Day 14:00 = ${summary.windows.day.zodiacSign}, Evening 20:00 = ${summary.windows.evening.zodiacSign}`
-  );
-
-  if (personal) {
-    const profileObj = dict.profiles[personal.profileKey];
-    const ageObj = dict.age_classes[personal.ageClassKey];
-    const phaseObj = dict.phases[personal.phaseKey];
-    const roleObj = dict.roles[personal.roleKey];
-    const harmonizedRoleTone = getRoleToneOrHint(dict, personal.roleKey, personal.phaseKey);
-    const phaseDayNote =
-      dict.phase_day_notes?.[personal.phaseKey]?.[personal.phaseStage.key] ||
-      personal.phaseStage.hint;
-    const hasTension = Boolean(buildHarmonyBridge(personal, sign, personal.dailyFocusEdge));
-    const tipText = getRotatedLifestyleTip(
-      dict,
-      personal.phaseKey,
-      personal.timeSlot,
-      summary.activeLunarDay,
-      personal.phaseStage.dayInPhase,
-      isoDate
-    );
+  if (hasBirthData) {
+    const personal = raw.personal;
+    const phase = dict.phases?.[personal.phaseKey];
+    const profile = dict.profiles?.[personal.profileKey];
+    const ageClass = dict.age_classes?.[personal.ageClassKey];
+    const role = dict.roles?.[personal.roleKey];
+    const focus = personal.dailyFocusEdge;
 
     lines.push(
-      `- Birth Profile: ${profileObj?.title || personal.profileKey}`,
-      `- Age Guideline: ${ageObj?.title || personal.ageClassKey} — ${ageObj?.modifier_hint || ''}`,
-      `- Personal Cycle Phase: ${phaseObj?.title || personal.phaseKey} (${personal.phaseKey}) [${phaseObj?.badge || ''}, ${phaseObj?.tempo || ''}], Day ${personal.phaseStage.dayInPhase} of ${personal.phaseStage.totalDays} (${personal.phaseStage.label})`,
-      `- Phase Focus: ${phaseDayNote}`,
-      `- Operational Role: ${roleObj?.title || personal.roleKey} (${personal.roleKey}) — ${harmonizedRoleTone}`
+      `- Personal phase: ${personal.phaseKey}${phase ? ` — ${phase.badge}; tempo ${phase.tempo}; action ${phase.action}` : ''}`
     );
-
-    if (hasTension) {
+    lines.push(
+      `- Stage inside the phase: ${personal.phaseStage?.key} (day ${personal.phaseStage?.dayInPhase} of ${personal.phaseStage?.totalDays})`
+    );
+    if (profile) {
+      lines.push(`- Profile: ${personal.profileKey} — ${profile.title} (${profile.short_desc})`);
+    }
+    if (ageClass) {
       lines.push(
-        `- Pacing Harmonization: Active external/role momentum overlaps with a low-tempo personal phase; restrict energy strictly to closing already-started short tasks and incoming replies rather than starting new initiatives.`
+        `- Age class: ${personal.ageClassKey} — ${ageClass.title} (${getCategoryDescriptor(ageClass.modifier_hint)})`
       );
     }
-
-    const lunarPolarity = getLunarDayPolarity(summary.activeLunarDay);
-    const personalPolarity = getPersonalPacingPolarity(personal.phaseKey);
-    if (personalPolarity === 'passive' && lunarPolarity === 'active') {
+    if (role) {
+      lines.push(`- Operational role: ${personal.roleKey} — ${role.title} (${role.hint})`);
+    }
+    if (focus) {
+      const peak =
+        typeof focus.peakHour === 'number'
+          ? `, peak around ${String(focus.peakHour).padStart(2, '0')}:00`
+          : '';
       lines.push(
-        `- Environment vs Personal Pacing Contrast: Active lunar day (${toEnglishOrdinal(summary.activeLunarDay)}) accelerates external business activity while personal rhythm (${personal.phaseKey}) requires recovery — explicitly separate external rush from personal capacity and forbid new project starts.`
-      );
-    } else if (personalPolarity === 'active' && lunarPolarity === 'restrained') {
-      lines.push(
-        `- Environment vs Personal Pacing Contrast: Personal capacity (${personal.phaseKey}) is high while the lunar day (${toEnglishOrdinal(summary.activeLunarDay)}) signals extra external friction — channel strong personal drive carefully with double-checked terms and zero impulsive risk.`
+        `- Primary aspect of the day: ${focus.transit} -> natal ${focus.natal}: ${focus.aspectKey} (exact angle ${focus.angle}°, orb ${Number(focus.diff).toFixed(2)}°, ${focus.dynamicKey}${peak})`
       );
     }
-
-    if (personal.dailyFocusEdge) {
-      const e = personal.dailyFocusEdge;
-      const actor = dict.actors[e.actorKey] || dict.actors.actor_moon;
-      const maneuver = dict.maneuvers[e.aspectKey];
-      const aspectTitle = maneuver?.title || `${e.angle}° aspect`;
-      const advice = getEdgeScenarioAdvice(dict, e);
-      const dyn = dict.aspect_dynamics?.[e.dynamicKey] || e.dynamicKey;
-      lines.push(
-        `- Primary Daily Aspect: ${e.transit} -> natal ${e.natal}: ${aspectTitle} (${e.angle}°, orb ${e.diff}°)`,
-        `  - Sphere: ${actor?.title || e.actorKey}`,
-        `  - Guidance: ${advice} (${dyn})`
-      );
-    } else {
-      lines.push(`- Primary Daily Focus: Moon in ${sign} (${zodiacHint})`);
-    }
-
     if (personal.backgroundEdge) {
-      const bg = personal.backgroundEdge;
-      const bgActor = dict.actors[bg.actorKey];
-      const bgManeuver = dict.maneuvers[bg.aspectKey];
-      const bgTitle = bgManeuver?.title || `${bg.angle}° aspect`;
-      const bgAdvice = getEdgeScenarioAdvice(dict, bg);
-      const bgDyn = dict.aspect_dynamics?.[bg.dynamicKey] || bg.dynamicKey;
+      const background = personal.backgroundEdge;
       lines.push(
-        `- Weekly Background Aspect: ${bg.transit} -> natal ${bg.natal}: ${bgTitle} (${bg.angle}°, orb ${bg.diff}°, exact peak today: ${personal.isBackgroundExactPeak ? 'YES' : 'NO'})`,
-        `  - Context (${bgActor?.title || bg.actorKey}): ${bgAdvice} (${bgDyn})`
+        `- Weekly background aspect: ${background.transit} -> natal ${background.natal}: ${background.aspectKey} (exact angle ${background.angle}°, orb ${Number(background.diff).toFixed(2)}°, ${background.dynamicKey})`
       );
     } else {
-      lines.push('- Weekly Background Aspect: None active within orb');
+      lines.push('- Weekly background aspect: none');
     }
-
-    lines.push(`- Recommended Lifestyle Habit (${personal.timeSlot}): ${tipText}`);
   } else {
-    lines.push('- Personal Cycle / Birth Profile: Not provided (General Lunar Calendar mode)');
+    lines.push('- no engine reading: without the birth data the engine classifies nothing');
   }
 
-  lines.push(
-    `- Active Dictionary: ${dict.meta?.name || 'Default'} (${lang})`,
-    '',
-    `IMPORTANT: Write your entire response in ${targetLangName}. Follow the 6-section output contract strictly.`
-  );
+  lines.push('');
+  lines.push('### TAXONOMY (labels only: what the categories are called and what they mean — not instructions)');
+  lines.push(...buildInterpretiveGlossary(dict));
 
   return lines.join('\n');
 }
@@ -3122,7 +3642,8 @@ function bindEvents() {
       const validKeys = [
         'meta', 'profiles', 'phases', 'phase_day_notes', 'roles', 'age_classes',
         'actors', 'moon_trends', 'moon_phase_names', 'zodiac_names', 'zodiac_hints', 'lunar_days',
-        'aspect_dynamics', 'maneuvers', 'actor_maneuver_matrix', 'lifestyle_tips', 'ui_labels'
+        'aspect_dynamics', 'maneuvers', 'actor_maneuver_matrix', 'lifestyle_tips',
+        'day_themes', 'phase_variants', 'role_tone', 'window_focus', 'ui_labels'
       ];
       const hasKnownSection =
         parsed &&
