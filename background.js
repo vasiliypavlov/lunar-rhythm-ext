@@ -17,6 +17,76 @@ const BADGE_ALARM = 'lunar_badge_refresh';
 const CHECKPOINT_PREFIX = 'checkpoint_';
 const REMINDER_PREFIX = 'reminder_';
 const ACTIVE_ALARM_BADGE_COLOR = '#E65100';
+let lastToolbarIconElongStep = null;
+
+function buildMoonToolbarImageData(size, elongDeg) {
+  const data = new Uint8ClampedArray(size * size * 4);
+  const cx = size * 0.42;
+  const cy = size * 0.42;
+  const R = size * 0.37;
+
+  const elongRad = ((((Number(elongDeg) || 0) % 360) + 360) % 360) * (Math.PI / 180);
+  const sx = Math.sin(elongRad);
+  const sz = -Math.cos(elongRad);
+
+  const softWidth = 0.16;
+  const halfSoft = softWidth * 0.5;
+  const aaWidth = 1.15 / R;
+
+  for (let py = 0; py < size; py++) {
+    const ny = (py + 0.5 - cy) / R;
+    const ny2 = ny * ny;
+    for (let px = 0; px < size; px++) {
+      const nx = (px + 0.5 - cx) / R;
+      const r2 = nx * nx + ny2;
+      const r = Math.sqrt(r2);
+      if (r > 1 + aaWidth) continue;
+
+      const edgeAlpha = r <= 1 - aaWidth
+        ? 1
+        : Math.max(0, Math.min(1, (1 + aaWidth - r) / (2 * aaWidth)));
+
+      const nz = Math.sqrt(Math.max(0, 1 - Math.min(1, r2)));
+      const dot = nx * sx + nz * sz;
+      const t = Math.max(0, Math.min(1, (dot + halfSoft) / softWidth));
+      const lit = t * t * (3 - 2 * t);
+
+      // Subtle cool rim on night side so New Moon and crescent edge stay crisp on dark toolbars
+      const rim = r >= 0.84 ? Math.min(1, (r - 0.84) / 0.16) * 0.45 : 0;
+      const nightR = 20 + rim * (92 - 20);
+      const nightG = 25 + rim * (106 - 25);
+      const nightB = 38 + rim * (142 - 38);
+
+      const idx = (py * size + px) * 4;
+      data[idx] = Math.round(nightR + lit * (234 - nightR));
+      data[idx + 1] = Math.round(nightG + lit * (179 - nightG));
+      data[idx + 2] = Math.round(nightB + lit * (46 - nightB));
+      data[idx + 3] = Math.round(edgeAlpha * 255);
+    }
+  }
+
+  return new ImageData(data, size, size);
+}
+
+async function syncToolbarMoonIcon(elongDeg) {
+  if (!chrome?.action || typeof chrome.action.setIcon !== 'function') return;
+  const norm = (((Number(elongDeg) || 0) % 360) + 360) % 360;
+  const step = Math.round(norm / 2);
+  if (step === lastToolbarIconElongStep) return;
+
+  try {
+    await chrome.action.setIcon({
+      imageData: {
+        16: buildMoonToolbarImageData(16, norm),
+        32: buildMoonToolbarImageData(32, norm),
+        48: buildMoonToolbarImageData(48, norm)
+      }
+    });
+    lastToolbarIconElongStep = step;
+  } catch {
+    // Fallback silently to manifest default icons if setIcon fails
+  }
+}
 
 const DEFAULT_SETTINGS = {
   birthDate: null,
@@ -109,6 +179,10 @@ async function updateBadge() {
   const baseDict = getBuiltinDictionary(state.builtinLang);
   const labels = { ...baseDict.ui_labels, ...(dict.ui_labels || {}) };
 
+  const now = new Date();
+  const summary = getCalendarDayLunarSummary(now, now);
+  await syncToolbarMoonIcon(summary.phaseInfo.elong);
+
   if (state.activeAlarm) {
     await chrome.action.setBadgeText({ text: '🔔' });
     await chrome.action.setBadgeBackgroundColor({ color: ACTIVE_ALARM_BADGE_COLOR });
@@ -120,8 +194,6 @@ async function updateBadge() {
     return;
   }
 
-  const now = new Date();
-  const summary = getCalendarDayLunarSummary(now, now);
   const badgeText = String(summary.activeLunarDay);
   const signLabel = getLocalizedZodiacSign(dict, summary.phaseInfo.zodiacSign);
 

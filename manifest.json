@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Ритм Дня / Lunar Rhythm Navigator",
   "short_name": "Ритм Дня",
-  "version": "1.0.7",
+  "version": "1.0.0",
   "description": "Автономный лунный календарь, персональный навигатор ритмов, граф аспектов и лунный будильник с голосовой сводкой.",
   "permissions": [
     "storage",
